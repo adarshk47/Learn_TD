@@ -14,60 +14,73 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-.stMetric > div { font-size: 18px; }
-div[data-testid="stSelectbox"] { margin-bottom: 0px; }
-</style>
-""", unsafe_allow_html=True)
+st.markdown("<style>.stMetric > div { font-size: 18px; }</style>", unsafe_allow_html=True)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("NSE Options Intelligence")
-    st.caption("Powered by Yahoo Finance (free, live)")
     st.divider()
 
-    instrument_type = st.radio("Instrument Type", ["Stock", "Index"])
+    instrument_type = st.radio("Instrument Type", ["Index", "Stock"])
 
-    if instrument_type == "Stock":
-        # Search box with autocomplete hint
-        search_query = st.text_input(
-            "Search Stock (type symbol or name)",
-            value="SBIN",
-            placeholder="e.g. SBIN, RELIANCE, TCS...",
-        ).upper().strip()
-
-        # Show matching suggestions
-        suggestions = search_stocks(search_query)
-        if suggestions:
-            options     = ["{} — {}".format(s, n) for s, n in suggestions]
-            selected    = st.selectbox("Select from matches", options, index=0)
-            symbol      = selected.split(" — ")[0]
-        else:
-            st.warning("No match found. Using: " + search_query)
-            symbol = search_query
-
-        is_index = False
-        st.caption("NSE symbol: **" + symbol + ".NS**")
-
-    else:
+    if instrument_type == "Index":
         index_options = ["{} — {}".format(k, v) for k, v in INDICES.items()]
         selected_idx  = st.selectbox("Select Index", index_options)
         symbol        = selected_idx.split(" — ")[0]
         is_index      = True
+    else:
+        search_query = st.text_input(
+            "Search Stock", value="SBIN",
+            placeholder="Type symbol or name: SBIN, HDFC, TATA..."
+        ).upper().strip()
+        suggestions = search_stocks(search_query)
+        if suggestions:
+            opts     = ["{} — {}".format(s, n) for s, n in suggestions]
+            selected = st.selectbox("Matches", opts, index=0)
+            symbol   = selected.split(" — ")[0]
+        else:
+            st.warning("No match. Using: " + search_query)
+            symbol = search_query
+        is_index = False
 
-    st.divider()
     num_strikes      = st.slider("Strikes around ATM", 10, 40, 20, step=2)
     auto_refresh     = st.checkbox("Auto Refresh", value=False)
-    refresh_interval = st.selectbox("Refresh every (seconds)", [30, 60, 120], index=1)
+    refresh_interval = st.selectbox("Refresh every (sec)", [30, 60, 120], index=1)
 
     st.divider()
     demo_mode = st.toggle("Demo Mode", value=False,
-                          help="Simulated data — no internet needed")
+                          help="Show simulated data — use this if NSE is unavailable")
+
     st.divider()
-    if st.button("Refresh Now", use_container_width=True, type="primary"):
-        st.cache_data.clear()
-    st.caption("Last updated: " + datetime.now().strftime("%H:%M:%S"))
+    col_r, col_t = st.columns(2)
+    with col_r:
+        if st.button("Refresh", use_container_width=True, type="primary"):
+            st.cache_data.clear()
+    with col_t:
+        test_mode = st.button("Test NSE", use_container_width=True)
+
+    st.caption("Updated: " + datetime.now().strftime("%H:%M:%S"))
+
+# ── Test connection button ────────────────────────────────────────────────────
+if test_mode:
+    with st.spinner("Testing NSE connection for {} ...".format(symbol)):
+        raw = fetch_option_chain(symbol, is_index)
+    if "error" in raw:
+        st.error("NSE connection FAILED: " + raw["error"])
+        st.info("Try running the app during market hours (9:15 AM - 3:30 PM IST) on your home/office internet.")
+    elif not raw:
+        st.error("NSE returned empty response.")
+    else:
+        keys = list(raw.keys())
+        st.success("NSE connection OK! Top-level keys: " + str(keys))
+        if "records" in raw:
+            rec = raw["records"]
+            st.write("underlyingValue:", rec.get("underlyingValue"))
+            st.write("expiryDates:", rec.get("expiryDates", [])[:3])
+            st.write("record count:", len(rec.get("data", [])))
+            if rec.get("data"):
+                st.write("First record sample:", rec["data"][0])
+    st.stop()
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
@@ -77,17 +90,23 @@ def get_live_data(sym, idx, strikes):
     return df, meta
 
 if demo_mode:
-    df, meta = generate_demo_option_chain("NIFTY")
-    st.info("Demo Mode ON — showing simulated data.")
+    df, meta = generate_demo_option_chain(symbol if is_index else "NIFTY")
+    st.info("Demo Mode ON — simulated data. Toggle off for live NSE data.")
 else:
-    with st.spinner("Fetching {} option chain via Yahoo Finance...".format(symbol)):
+    with st.spinner("Fetching {} from NSE (takes ~5 sec for cookie warm-up)...".format(symbol)):
         df, meta = get_live_data(symbol, is_index, num_strikes)
+
     if "error" in meta:
         st.error("Fetch failed: " + meta["error"])
-        st.info("Try a different stock symbol, or enable **Demo Mode** in the sidebar.")
+        st.warning(
+            "NSE requires cookies from their website. This works only on **Indian internet connections** "
+            "during **market hours**. \n\n"
+            "1. Click **Test NSE** button in sidebar to diagnose\n"
+            "2. Enable **Demo Mode** to see the dashboard with sample data"
+        )
         st.stop()
     if df.empty:
-        st.warning("No option chain data returned. Try a different stock or enable Demo Mode.")
+        st.warning("No option chain data. Enable Demo Mode to preview.")
         st.stop()
 
 # ── Signal ────────────────────────────────────────────────────────────────────
@@ -99,16 +118,16 @@ max_pain   = sig["max_pain"]
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
-st.markdown("**Spot Price: Rs.{:,.2f}**  |  ATM Strike: **{}**".format(underlying, meta["atm"]))
+st.markdown("**Spot: Rs.{:,.2f}**  |  ATM: **{}**".format(underlying, meta["atm"]))
 st.divider()
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Spot Price",     "Rs.{:,.1f}".format(underlying))
-c2.metric("PCR",            str(pcr),   delta="Bullish" if pcr > 1.0 else "Bearish")
-c3.metric("Max Pain",       "Rs.{:,.0f}".format(max_pain))
-c4.metric("CE Resistance",  "Rs.{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
-c5.metric("PE Support",     "Rs.{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+c1.metric("Spot Price",    "Rs.{:,.1f}".format(underlying))
+c2.metric("PCR",           str(pcr), delta="Bullish" if pcr > 1.0 else "Bearish")
+c3.metric("Max Pain",      "Rs.{:,.0f}".format(max_pain))
+c4.metric("CE Resistance", "Rs.{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
+c5.metric("PE Support",    "Rs.{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
 st.divider()
 
 # ── Signal panel ──────────────────────────────────────────────────────────────
@@ -119,10 +138,10 @@ with sig_col:
     border = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(sig["color"], "#888")
     st.markdown(
         '<div style="background:{}; border:3px solid {}; padding:25px; border-radius:14px; text-align:center;">'
-        '<div style="font-size:14px; color:#ccc; margin-bottom:6px;">TRADE SIGNAL</div>'
-        '<div style="font-size:32px; font-weight:bold; color:{};">{}</div>'
-        '<div style="font-size:16px; color:#ddd; margin-top:8px;">Confidence</div>'
-        '<div style="font-size:42px; font-weight:bold; color:white;">{}%</div>'
+        '<div style="font-size:14px;color:#ccc;margin-bottom:6px;">TRADE SIGNAL</div>'
+        '<div style="font-size:32px;font-weight:bold;color:{};">{}</div>'
+        '<div style="font-size:16px;color:#ddd;margin-top:8px;">Confidence</div>'
+        '<div style="font-size:42px;font-weight:bold;color:white;">{}%</div>'
         '</div>'.format(bg, border, border, sig["signal"], sig["confidence"]),
         unsafe_allow_html=True
     )
@@ -146,24 +165,20 @@ with sig_col:
 with reason_col:
     st.markdown("#### Analysis Breakdown")
     for r in sig["reasons"]:
-        r_lower = r.lower()
-        if any(w in r_lower for w in ["bullish", "support", "upward", "pe writing"]):
-            icon = "🟢"
-        elif any(w in r_lower for w in ["bearish", "resistance", "downward", "ce writing"]):
-            icon = "🔴"
-        else:
-            icon = "🟡"
+        rl = r.lower()
+        icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing"]) else \
+               "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing"]) else "🟡"
         st.markdown(icon + " " + r)
     st.markdown("---")
     st.markdown("#### Key Levels")
     st.dataframe(pd.DataFrame({
-        "Level": ["Spot Price", "Max Pain", "CE Resistance (OI)", "PE Support (OI)"],
+        "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
         "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
     }), hide_index=True, use_container_width=True)
 
 st.divider()
 
-# ── OI Charts ─────────────────────────────────────────────────────────────────
+# ── Charts ────────────────────────────────────────────────────────────────────
 cc1, cc2 = st.columns(2)
 
 with cc1:
@@ -184,6 +199,22 @@ with cc1:
     st.plotly_chart(f, use_container_width=True)
 
 with cc2:
+    st.markdown("#### Change in OI")
+    f2 = go.Figure()
+    f2.add_trace(go.Bar(x=df["strike"], y=df["ce_chg_oi"]/1000, name="CE Chg OI", marker_color="#ef5350", opacity=0.85))
+    f2.add_trace(go.Bar(x=df["strike"], y=df["pe_chg_oi"]/1000, name="PE Chg OI", marker_color="#26a69a", opacity=0.85))
+    f2.add_vline(x=underlying, line_dash="dash", line_color="white",
+                 annotation_text="Spot {}".format(int(underlying)), annotation_font_color="white")
+    f2.update_layout(barmode="group", height=320,
+                     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                     legend=dict(orientation="h", y=1.1),
+                     xaxis=dict(title="Strike", gridcolor="#333"),
+                     yaxis=dict(title="Chg OI (thousands)", gridcolor="#333"),
+                     margin=dict(t=20, b=10))
+    st.plotly_chart(f2, use_container_width=True)
+
+ic1, ic2 = st.columns(2)
+with ic1:
     st.markdown("#### Implied Volatility Smile")
     iv_df = df[(df["ce_iv"] > 0) | (df["pe_iv"] > 0)]
     fi = go.Figure()
@@ -193,41 +224,31 @@ with cc2:
         fi.add_trace(go.Scatter(x=iv_df["strike"], y=iv_df["pe_iv"], mode="lines+markers",
                                 name="PE IV", line=dict(color="#26a69a", width=2)))
         fi.add_vline(x=underlying, line_dash="dash", line_color="white")
-    fi.update_layout(height=320, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    fi.update_layout(height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                      legend=dict(orientation="h", y=1.1),
                      xaxis=dict(title="Strike", gridcolor="#333"),
                      yaxis=dict(title="IV %", gridcolor="#333"),
                      margin=dict(t=20, b=10))
     st.plotly_chart(fi, use_container_width=True)
 
-# ── PCR card ──────────────────────────────────────────────────────────────────
-pc1, pc2 = st.columns(2)
-with pc1:
+with ic2:
     st.markdown("#### PCR Interpretation")
-    if   pcr > 1.5: interp, pcr_col = "EXTREMELY BULLISH",          "#00e676"
-    elif pcr > 1.2: interp, pcr_col = "BULLISH - strong put writing","#4CAF50"
-    elif pcr > 0.8: interp, pcr_col = "NEUTRAL to BULLISH",          "#8BC34A"
-    elif pcr > 0.5: interp, pcr_col = "NEUTRAL to BEARISH",          "#FF9800"
-    else:           interp, pcr_col = "BEARISH - heavy call writing", "#f44336"
+    if   pcr > 1.5: interp, pcr_col = "EXTREMELY BULLISH",           "#00e676"
+    elif pcr > 1.2: interp, pcr_col = "BULLISH - strong put writing", "#4CAF50"
+    elif pcr > 0.8: interp, pcr_col = "NEUTRAL to BULLISH",           "#8BC34A"
+    elif pcr > 0.5: interp, pcr_col = "NEUTRAL to BEARISH",           "#FF9800"
+    else:           interp, pcr_col = "BEARISH - heavy call writing",  "#f44336"
     st.markdown(
-        '<div style="background:#1e1e2e; padding:20px; border-radius:12px;">'
-        '<div style="font-size:48px; font-weight:bold; color:{}; text-align:center;">{}</div>'
-        '<div style="font-size:16px; color:{}; text-align:center; margin-top:8px;">{}</div>'
-        '<hr style="border-color:#333; margin:15px 0;">'
-        '<div style="font-size:13px; color:#aaa;">'
-        'PCR &lt; 0.5 = Bearish &nbsp;|&nbsp; 0.5-0.8 = Neutral-Bearish<br>'
-        'PCR 0.8-1.2 = Neutral &nbsp;|&nbsp; 1.2-1.5 = Bullish<br>'
-        'PCR &gt; 1.5 = Extremely Bullish'
+        '<div style="background:#1e1e2e;padding:20px;border-radius:12px;">'
+        '<div style="font-size:48px;font-weight:bold;color:{};text-align:center;">{}</div>'
+        '<div style="font-size:16px;color:{};text-align:center;margin-top:8px;">{}</div>'
+        '<hr style="border-color:#333;margin:15px 0;">'
+        '<div style="font-size:13px;color:#aaa;">'
+        'PCR &lt;0.5=Bearish | 0.5-0.8=Neutral-Bearish<br>'
+        'PCR 0.8-1.2=Neutral | 1.2-1.5=Bullish | &gt;1.5=Extremely Bullish'
         '</div></div>'.format(pcr_col, pcr, pcr_col, interp),
         unsafe_allow_html=True
     )
-
-with pc2:
-    # Expiry selector info
-    st.markdown("#### Available Expiries")
-    for i, exp in enumerate(meta.get("all_expiries", [expiry])[:6]):
-        tag = " ← current" if i == 0 else ""
-        st.markdown("- **{}**{}".format(exp, tag))
 
 st.divider()
 
@@ -236,18 +257,16 @@ st.markdown("#### Full Option Chain Table")
 tdf     = df.copy()
 atm_idx = (tdf["strike"] - underlying).abs().idxmin()
 tdf = tdf.rename(columns={
-    "ce_oi": "CE OI", "ce_chg_oi": "CE Chg OI", "ce_volume": "CE Vol",
-    "ce_iv": "CE IV%", "ce_ltp": "CE LTP", "strike": "STRIKE",
-    "pe_ltp": "PE LTP", "pe_iv": "PE IV%", "pe_volume": "PE Vol",
-    "pe_chg_oi": "PE Chg OI", "pe_oi": "PE OI",
+    "ce_oi":"CE OI","ce_chg_oi":"CE Chg OI","ce_volume":"CE Vol",
+    "ce_iv":"CE IV%","ce_ltp":"CE LTP","strike":"STRIKE",
+    "pe_ltp":"PE LTP","pe_iv":"PE IV%","pe_volume":"PE Vol",
+    "pe_chg_oi":"PE Chg OI","pe_oi":"PE OI",
 })
 cols = ["CE OI","CE Chg OI","CE Vol","CE IV%","CE LTP","STRIKE","PE LTP","PE IV%","PE Vol","PE Chg OI","PE OI"]
 tdf  = tdf[cols]
 
 def hl_atm(row):
-    if row.name == atm_idx:
-        return ["background-color:#2d2d00; font-weight:bold"] * len(row)
-    return [""] * len(row)
+    return ["background-color:#2d2d00;font-weight:bold"]*len(row) if row.name==atm_idx else [""]*len(row)
 
 fmt = {
     "CE OI":"{:,.0f}","CE Chg OI":"{:,.0f}","CE Vol":"{:,.0f}",
@@ -258,7 +277,7 @@ fmt = {
 st.dataframe(tdf.style.apply(hl_atm, axis=1).format(fmt), use_container_width=True, height=400)
 
 st.markdown("---")
-st.caption("Data: Yahoo Finance (yfinance)  |  For educational purposes only. Not financial advice.")
+st.caption("Data: NSE India  |  For educational purposes only. Not financial advice.")
 
 if auto_refresh:
     time.sleep(refresh_interval)
