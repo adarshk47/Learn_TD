@@ -163,7 +163,7 @@ def _login():
     cfg   = ANGEL_ONE
     totp  = pyotp.TOTP(cfg["totp_secret"]).now()
     smart = SmartConnect(api_key=cfg["api_key"])
-    data  = smart.generateSession(cfg["client_id"], cfg["password"], totp)
+    data  = smart.generateSession(cfg["client_id"], cfg["mpin"], totp)
     if not data.get("status"):
         raise RuntimeError("Angel One login failed: " + str(data.get("message", data)))
     _smart      = smart
