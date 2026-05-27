@@ -1,139 +1,105 @@
-import requests
 import pandas as pd
+import numpy as np
+import yfinance as yf
 import time
 
-NSE_HEADERS = {
-    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language":           "en-US,en;q=0.9",
-    "Accept-Encoding":           "gzip, deflate, br",
-    "Connection":                "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest":            "document",
-    "Sec-Fetch-Mode":            "navigate",
-    "Sec-Fetch-Site":            "none",
-    "Sec-Fetch-User":            "?1",
-    "Cache-Control":             "max-age=0",
-}
-
-API_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept":          "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer":         "https://www.nseindia.com/option-chain",
-    "X-Requested-With":"XMLHttpRequest",
-    "Sec-Fetch-Dest":  "empty",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Site":  "same-origin",
-    "Connection":      "keep-alive",
-}
-
-BASE_URL          = "https://www.nseindia.com"
-OPTION_CHAIN_URL  = BASE_URL + "/api/option-chain-indices?symbol={symbol}"
-STOCK_OPTION_URL  = BASE_URL + "/api/option-chain-equities?symbol={symbol}"
-
-_session      = None
-_session_time = 0
+# yfinance symbol mapping for NSE
+def _yf_symbol(symbol, is_index=False):
+    index_map = {
+        "NIFTY":      "^NSEI",
+        "BANKNIFTY":  "^NSEBANK",
+        "FINNIFTY":   "^CNXFIN",
+        "MIDCPNIFTY": "^NSEMDCP50",
+    }
+    if is_index:
+        return index_map.get(symbol, "^NSEI")
+    return symbol + ".NS"
 
 
-def _build_session():
-    """
-    NSE requires a browser-like warm-up before API calls will succeed.
-    Step 1: visit homepage  (get base cookies)
-    Step 2: visit option-chain page  (get NSE-specific cookies)
-    Step 3: API call is now accepted
-    """
-    s = requests.Session()
-    s.headers.update(NSE_HEADERS)
+def fetch_option_chain(symbol, is_index=False):
     try:
-        s.get(BASE_URL, timeout=10)
-        time.sleep(1)
-        s.get(BASE_URL + "/option-chain", timeout=10)
-        time.sleep(0.5)
-    except Exception:
-        pass
-    s.headers.update(API_HEADERS)
-    return s
+        yf_sym = _yf_symbol(symbol, is_index)
+        ticker  = yf.Ticker(yf_sym)
+        info    = ticker.fast_info
 
-
-def _get_session():
-    global _session, _session_time
-    if _session is None or (time.time() - _session_time) > 300:
-        _session      = _build_session()
-        _session_time = time.time()
-    return _session
-
-
-def fetch_option_chain(symbol, is_index=True):
-    url = OPTION_CHAIN_URL.format(symbol=symbol) if is_index else STOCK_OPTION_URL.format(symbol=symbol)
-    for attempt in range(2):
+        # Get spot price
         try:
-            session  = _get_session()
-            resp     = session.get(url, timeout=15)
-            if resp.status_code in (401, 403, 404) and attempt == 0:
-                global _session
-                _session = None
-                time.sleep(1.5)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            if attempt == 0:
-                global _session
-                _session = None
-                time.sleep(1.5)
-            else:
-                return {"error": str(e)}
-    return {"error": "Failed after 2 attempts"}
+            spot = info.last_price
+        except Exception:
+            spot = ticker.history(period="1d")["Close"].iloc[-1]
+
+        # Get option expiry dates
+        expiries = ticker.options
+        if not expiries:
+            return {"error": "No option chain available for {}. Try a different stock (e.g. SBIN, RELIANCE).".format(symbol)}
+
+        nearest = expiries[0]
+        chain   = ticker.option_chain(nearest)
+        calls   = chain.calls
+        puts    = chain.puts
+
+        return {
+            "_format":   "yfinance",
+            "_calls":    calls,
+            "_puts":     puts,
+            "_spot":     spot,
+            "_expiry":   nearest,
+            "_expiries": list(expiries),
+            "_symbol":   symbol,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def parse_option_chain(data, num_strikes=20):
     if "error" in data:
         return pd.DataFrame(), {"error": data["error"]}
+
     try:
-        records        = data["records"]["data"]
-        expiry_dates   = data["records"]["expiryDates"]
-        underlying_val = data["records"]["underlyingValue"]
-        nearest_expiry = expiry_dates[0]
+        calls    = data["_calls"].copy()
+        puts     = data["_puts"].copy()
+        spot     = data["_spot"]
+        expiry   = data["_expiry"]
+        expiries = data["_expiries"]
 
-        rows = []
-        for rec in records:
-            if rec.get("expiryDate") != nearest_expiry:
-                continue
-            strike = rec["strikePrice"]
-            ce     = rec.get("CE", {})
-            pe     = rec.get("PE", {})
-            rows.append({
-                "strike":    strike,
-                "ce_oi":     ce.get("openInterest", 0),
-                "ce_chg_oi": ce.get("changeinOpenInterest", 0),
-                "ce_volume": ce.get("totalTradedVolume", 0),
-                "ce_iv":     ce.get("impliedVolatility", 0),
-                "ce_ltp":    ce.get("lastPrice", 0),
-                "ce_bid":    ce.get("bidPrice", 0),
-                "ce_ask":    ce.get("askPrice", 0),
-                "pe_oi":     pe.get("openInterest", 0),
-                "pe_chg_oi": pe.get("changeinOpenInterest", 0),
-                "pe_volume": pe.get("totalTradedVolume", 0),
-                "pe_iv":     pe.get("impliedVolatility", 0),
-                "pe_ltp":    pe.get("lastPrice", 0),
-                "pe_bid":    pe.get("bidPrice", 0),
-                "pe_ask":    pe.get("askPrice", 0),
-            })
+        # Rename yfinance columns to our internal format
+        calls = calls[["strike", "openInterest", "volume", "impliedVolatility",
+                        "lastPrice", "bid", "ask"]].copy()
+        puts  = puts[["strike",  "openInterest", "volume", "impliedVolatility",
+                        "lastPrice", "bid", "ask"]].copy()
 
-        df      = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
-        atm_idx = (df["strike"] - underlying_val).abs().idxmin()
+        calls.columns = ["strike", "ce_oi",  "ce_volume", "ce_iv",  "ce_ltp",  "ce_bid",  "ce_ask"]
+        puts.columns  = ["strike", "pe_oi",  "pe_volume", "pe_iv",  "pe_ltp",  "pe_bid",  "pe_ask"]
+
+        # yfinance gives IV as decimal (0.20 = 20%) — convert to %
+        calls["ce_iv"] = (calls["ce_iv"] * 100).round(1)
+        puts["pe_iv"]  = (puts["pe_iv"]  * 100).round(1)
+
+        # yfinance doesn't provide change-in-OI directly
+        calls["ce_chg_oi"] = 0
+        puts["pe_chg_oi"]  = 0
+
+        df = pd.merge(calls, puts, on="strike", how="outer").fillna(0)
+        df = df.sort_values("strike").reset_index(drop=True)
+        df["strike"] = df["strike"].astype(float)
+
+        if df.empty:
+            return pd.DataFrame(), {"error": "Empty option chain returned"}
+
+        # Slice around ATM
+        atm_idx = (df["strike"] - spot).abs().idxmin()
         half    = num_strikes // 2
-        df      = df.iloc[max(0, atm_idx - half): atm_idx + half].reset_index(drop=True)
-        atm     = df.iloc[(df["strike"] - underlying_val).abs().idxmin()]["strike"]
+        df      = df.iloc[max(0, atm_idx - half): min(len(df), atm_idx + half)].reset_index(drop=True)
+        atm     = df.iloc[(df["strike"] - spot).abs().idxmin()]["strike"]
 
-        return df, {
-            "underlying":   underlying_val,
-            "expiry":       nearest_expiry,
-            "all_expiries": expiry_dates,
+        meta = {
+            "underlying":   round(spot, 2),
+            "expiry":       expiry,
+            "all_expiries": expiries,
             "atm":          atm,
         }
+        return df, meta
+
     except Exception as e:
         return pd.DataFrame(), {"error": str(e)}
 
@@ -162,8 +128,11 @@ def calculate_max_pain(df):
 
 def generate_signal(df, meta):
     if df.empty:
-        return {"signal": "NO DATA", "confidence": 0, "reasons": [], "color": "orange",
-                "pcr": 0, "max_pain": 0, "max_ce_resistance": 0, "max_pe_support": 0, "score": 0}
+        return {
+            "signal": "NO DATA", "confidence": 0, "reasons": [],
+            "color": "orange", "pcr": 0, "max_pain": 0,
+            "max_ce_resistance": 0, "max_pe_support": 0, "score": 0,
+        }
 
     underlying = meta.get("underlying", 0)
     pcr        = calculate_pcr(df)
@@ -204,8 +173,12 @@ def generate_signal(df, meta):
         score -= 15
         reasons.append("Fresh CE writing near ATM (resistance building)")
 
-    max_ce_strike = df.loc[df["ce_oi"].idxmax(), "strike"]
-    max_pe_strike = df.loc[df["pe_oi"].idxmax(), "strike"]
+    # Ensure OI columns have non-zero values before idxmax
+    ce_col = df["ce_oi"]
+    pe_col = df["pe_oi"]
+    max_ce_strike = df.loc[ce_col.idxmax(), "strike"] if ce_col.sum() > 0 else underlying
+    max_pe_strike = df.loc[pe_col.idxmax(), "strike"] if pe_col.sum() > 0 else underlying
+
     if underlying < max_ce_strike:
         reasons.append("Resistance at {} (max CE OI)".format(int(max_ce_strike)))
     if underlying > max_pe_strike:
