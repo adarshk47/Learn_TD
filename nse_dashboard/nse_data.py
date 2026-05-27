@@ -2,7 +2,6 @@ import pandas as pd
 import time
 import requests
 
-# ── NSE session headers ───────────────────────────────────────────────────────
 _HEADERS = {
     "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "accept":          "*/*",
@@ -11,32 +10,52 @@ _HEADERS = {
     "referer":         "https://www.nseindia.com/option-chain",
 }
 
+_session      = None
+_session_time = 0
 
-def _nse_fetch(url):
-    """Open fresh session, warm up cookies, then fetch the API URL."""
+
+def _build_session():
     s = requests.Session()
-    try:
-        s.get("https://www.nseindia.com",               headers=_HEADERS, timeout=10)
-        time.sleep(2)
-        s.get("https://www.nseindia.com/option-chain",  headers=_HEADERS, timeout=10)
-        time.sleep(1)
-        r = s.get(url, headers=_HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+    s.get("https://www.nseindia.com",              headers=_HEADERS, timeout=10)
+    time.sleep(2)
+    s.get("https://www.nseindia.com/option-chain", headers=_HEADERS, timeout=10)
+    time.sleep(1)
+    return s
+
+
+def _reset_session():
+    global _session, _session_time
+    _session      = _build_session()
+    _session_time = time.time()
 
 
 def fetch_option_chain(symbol, is_index=True):
+    global _session, _session_time
+    if _session is None or (time.time() - _session_time) > 300:
+        _reset_session()
+
     if is_index:
         url = "https://www.nseindia.com/api/option-chain-indices?symbol={}".format(symbol)
     else:
         url = "https://www.nseindia.com/api/option-chain-equities?symbol={}".format(symbol)
-    return _nse_fetch(url)
+
+    for attempt in range(2):
+        try:
+            r = _session.get(url, headers=_HEADERS, timeout=15)
+            if r.status_code in (401, 403, 404):
+                _reset_session()
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt == 0:
+                _reset_session()
+            else:
+                return {"error": str(e)}
+    return {"error": "NSE fetch failed after retry"}
 
 
 def parse_option_chain(data, num_strikes=20):
-    # ── guard: empty or error ─────────────────────────────────────────────────
     if not data:
         return pd.DataFrame(), {"error": "Empty response from NSE"}
     if "error" in data:
@@ -51,8 +70,6 @@ def parse_option_chain(data, num_strikes=20):
         if not all_records:
             return pd.DataFrame(), {"error": "NSE returned no records"}
 
-        # ── find nearest expiry from the RECORDS themselves ───────────────────
-        # (avoids date-format mismatch between header list and record strings)
         seen = []
         for r in all_records:
             e = r.get("expiryDate", "")
@@ -64,7 +81,6 @@ def parse_option_chain(data, num_strikes=20):
         for rec in all_records:
             if rec.get("expiryDate", "") != target_expiry:
                 continue
-            # handle both key names NSE has used over time
             strike = rec.get("strikePrice") or rec.get("strike")
             if not strike:
                 continue
@@ -102,6 +118,7 @@ def parse_option_chain(data, num_strikes=20):
             "expiry":       target_expiry,
             "all_expiries": expiry_dates or seen,
             "atm":          atm,
+            "source":       "NSE Direct",
         }
 
     except Exception as e:
@@ -145,17 +162,15 @@ def generate_signal(df, meta):
     score      = 0
     reasons    = []
 
-    # PCR
     if pcr > 1.2:
-        score += 25; reasons.append("PCR={} (Bullish - high put writing)".format(pcr))
+        score += 25; reasons.append("PCR={} (Bullish — high put writing)".format(pcr))
     elif pcr > 0.8:
         score += 10; reasons.append("PCR={} (Neutral-Bullish)".format(pcr))
     elif pcr < 0.5:
-        score -= 25; reasons.append("PCR={} (Bearish - high call writing)".format(pcr))
+        score -= 25; reasons.append("PCR={} (Bearish — high call writing)".format(pcr))
     else:
         score -= 10; reasons.append("PCR={} (Neutral-Bearish)".format(pcr))
 
-    # Max Pain
     pain_pct = ((max_pain - underlying) / underlying * 100) if underlying else 0
     if pain_pct > 0.3:
         score += 20; reasons.append("Max Pain {} above spot (upward pull)".format(int(max_pain)))
@@ -164,7 +179,6 @@ def generate_signal(df, meta):
     else:
         reasons.append("Max Pain {} near spot (neutral)".format(int(max_pain)))
 
-    # ATM OI change
     atm_idx = (df["strike"] - underlying).abs().idxmin()
     near    = df.iloc[max(0, atm_idx - 3): atm_idx + 4]
     net_chg = near["pe_chg_oi"].sum() - near["ce_chg_oi"].sum()
@@ -173,7 +187,6 @@ def generate_signal(df, meta):
     elif net_chg < 0:
         score -= 15; reasons.append("Fresh CE writing near ATM (resistance building)")
 
-    # Support / resistance from max OI
     ce_sum = df["ce_oi"].sum()
     pe_sum = df["pe_oi"].sum()
     max_ce = df.loc[df["ce_oi"].idxmax(), "strike"] if ce_sum > 0 else underlying

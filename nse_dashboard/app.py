@@ -1,6 +1,8 @@
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
+import numpy as np
+import math
 import time
 from datetime import datetime
 from nse_data import fetch_option_chain, parse_option_chain, calculate_pcr, calculate_max_pain, generate_signal
@@ -48,8 +50,21 @@ with st.sidebar:
     refresh_interval = st.selectbox("Refresh every (sec)", [30, 60, 120], index=1)
 
     st.divider()
-    demo_mode = st.toggle("Demo Mode", value=False,
-                          help="Show simulated data — use this if NSE is unavailable")
+
+    data_source = st.radio(
+        "Data Source",
+        ["Angel One (Live)", "NSE Direct", "NSE CSV Upload", "Demo Mode"],
+        help="Angel One = live via SmartAPI | NSE Direct = requires Indian IP | "
+             "CSV = upload from nseindia.com | Demo = simulated data",
+    )
+
+    csv_file = None
+    if data_source == "NSE CSV Upload":
+        csv_file = st.file_uploader(
+            "Upload NSE Option Chain CSV",
+            type=["csv"],
+            help="Go to nseindia.com/option-chain, select expiry, click Download (CSV), upload here.",
+        )
 
     st.divider()
     col_r, col_t = st.columns(2)
@@ -61,13 +76,13 @@ with st.sidebar:
 
     st.caption("Updated: " + datetime.now().strftime("%H:%M:%S"))
 
-# ── Test connection button ────────────────────────────────────────────────────
+# ── Test NSE connection ───────────────────────────────────────────────────────
 if test_mode:
     with st.spinner("Testing NSE connection for {} ...".format(symbol)):
         raw = fetch_option_chain(symbol, is_index)
     if "error" in raw:
         st.error("NSE connection FAILED: " + raw["error"])
-        st.info("Try running the app during market hours (9:15 AM - 3:30 PM IST) on your home/office internet.")
+        st.info("Try running the app during market hours (9:15 AM – 3:30 PM IST) on Indian internet.")
     elif not raw:
         st.error("NSE returned empty response.")
     else:
@@ -83,31 +98,72 @@ if test_mode:
     st.stop()
 
 # ── Data fetch ────────────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=60)
-def get_live_data(sym, idx, strikes):
+def _get_nse_data(sym, idx, strikes):
     raw      = fetch_option_chain(sym, idx)
     df, meta = parse_option_chain(raw, strikes)
     return df, meta
 
-if demo_mode:
-    df, meta = generate_demo_option_chain(symbol if is_index else "NIFTY")
-    st.info("Demo Mode ON — simulated data. Toggle off for live NSE data.")
-else:
-    with st.spinner("Fetching {} from NSE (takes ~5 sec for cookie warm-up)...".format(symbol)):
-        df, meta = get_live_data(symbol, is_index, num_strikes)
+@st.cache_data(ttl=60)
+def _get_angelone_data(sym, idx, strikes):
+    from angelone_data import fetch_option_chain_angelone
+    return fetch_option_chain_angelone(sym, idx, strikes)
 
-    if "error" in meta:
-        st.error("Fetch failed: " + meta["error"])
-        st.warning(
-            "NSE requires cookies from their website. This works only on **Indian internet connections** "
-            "during **market hours**. \n\n"
-            "1. Click **Test NSE** button in sidebar to diagnose\n"
-            "2. Enable **Demo Mode** to see the dashboard with sample data"
+df   = pd.DataFrame()
+meta = {}
+
+if data_source == "Demo Mode":
+    df, meta = generate_demo_option_chain(symbol if is_index else "NIFTY")
+    st.info("Demo Mode ON — simulated data. Switch Data Source for live data.")
+
+elif data_source == "NSE CSV Upload":
+    if csv_file is None:
+        st.warning("Upload a CSV file from nseindia.com/option-chain to proceed.")
+        st.markdown(
+            "**How to download:**\n"
+            "1. Go to [nseindia.com/option-chain](https://www.nseindia.com/option-chain)\n"
+            "2. Select Index / Stock and Expiry\n"
+            "3. Click **Download (CSV)** button\n"
+            "4. Upload the file here"
         )
         st.stop()
-    if df.empty:
-        st.warning("No option chain data. Enable Demo Mode to preview.")
+    from csv_parser import parse_nse_csv
+    with st.spinner("Parsing uploaded CSV..."):
+        df, meta = parse_nse_csv(csv_file)
+    if "error" in meta:
+        st.error("CSV parse error: " + meta["error"])
         st.stop()
+
+elif data_source == "NSE Direct":
+    with st.spinner("Fetching {} from NSE (may need Indian IP + market hours)...".format(symbol)):
+        df, meta = _get_nse_data(symbol, is_index, num_strikes)
+    if "error" in meta:
+        st.error("NSE fetch failed: " + meta["error"])
+        st.warning(
+            "NSE requires Indian internet + market hours. \n\n"
+            "1. Click **Test NSE** to diagnose\n"
+            "2. Switch to **Angel One (Live)** or **Demo Mode**"
+        )
+        st.stop()
+
+else:  # Angel One (Live)
+    with st.spinner("Fetching {} via Angel One SmartAPI...".format(symbol)):
+        df, meta = _get_angelone_data(symbol, is_index, num_strikes)
+    if "error" in meta:
+        st.error("Angel One fetch failed: " + meta["error"])
+        st.warning(
+            "Possible causes:\n"
+            "- Angel One account dormant / not activated\n"
+            "- TOTP mismatch (check system clock)\n"
+            "- Market closed (pre-market / weekend)\n\n"
+            "Switch to **Demo Mode** to preview the dashboard."
+        )
+        st.stop()
+
+if df.empty:
+    st.warning("No option chain data. Enable Demo Mode to preview.")
+    st.stop()
 
 # ── Signal ────────────────────────────────────────────────────────────────────
 sig        = generate_signal(df, meta)
@@ -115,19 +171,21 @@ underlying = meta["underlying"]
 expiry     = meta["expiry"]
 pcr        = sig["pcr"]
 max_pain   = sig["max_pain"]
+source_tag = meta.get("source", data_source)
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
-st.markdown("**Spot: Rs.{:,.2f}**  |  ATM: **{}**".format(underlying, meta["atm"]))
+st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
+    underlying, meta["atm"], source_tag))
 st.divider()
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Spot Price",    "Rs.{:,.1f}".format(underlying))
+c1.metric("Spot Price",    "₹{:,.1f}".format(underlying))
 c2.metric("PCR",           str(pcr), delta="Bullish" if pcr > 1.0 else "Bearish")
-c3.metric("Max Pain",      "Rs.{:,.0f}".format(max_pain))
-c4.metric("CE Resistance", "Rs.{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
-c5.metric("PE Support",    "Rs.{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+c3.metric("Max Pain",      "₹{:,.0f}".format(max_pain))
+c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
+c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
 st.divider()
 
 # ── Signal panel ──────────────────────────────────────────────────────────────
@@ -165,7 +223,7 @@ with sig_col:
 with reason_col:
     st.markdown("#### Analysis Breakdown")
     for r in sig["reasons"]:
-        rl = r.lower()
+        rl   = r.lower()
         icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing"]) else \
                "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing"]) else "🟡"
         st.markdown(icon + " " + r)
@@ -217,7 +275,7 @@ ic1, ic2 = st.columns(2)
 with ic1:
     st.markdown("#### Implied Volatility Smile")
     iv_df = df[(df["ce_iv"] > 0) | (df["pe_iv"] > 0)]
-    fi = go.Figure()
+    fi    = go.Figure()
     if not iv_df.empty:
         fi.add_trace(go.Scatter(x=iv_df["strike"], y=iv_df["ce_iv"], mode="lines+markers",
                                 name="CE IV", line=dict(color="#ef5350", width=2)))
@@ -234,21 +292,94 @@ with ic1:
 with ic2:
     st.markdown("#### PCR Interpretation")
     if   pcr > 1.5: interp, pcr_col = "EXTREMELY BULLISH",           "#00e676"
-    elif pcr > 1.2: interp, pcr_col = "BULLISH - strong put writing", "#4CAF50"
+    elif pcr > 1.2: interp, pcr_col = "BULLISH — strong put writing", "#4CAF50"
     elif pcr > 0.8: interp, pcr_col = "NEUTRAL to BULLISH",           "#8BC34A"
     elif pcr > 0.5: interp, pcr_col = "NEUTRAL to BEARISH",           "#FF9800"
-    else:           interp, pcr_col = "BEARISH - heavy call writing",  "#f44336"
+    else:           interp, pcr_col = "BEARISH — heavy call writing",  "#f44336"
     st.markdown(
         '<div style="background:#1e1e2e;padding:20px;border-radius:12px;">'
         '<div style="font-size:48px;font-weight:bold;color:{};text-align:center;">{}</div>'
         '<div style="font-size:16px;color:{};text-align:center;margin-top:8px;">{}</div>'
         '<hr style="border-color:#333;margin:15px 0;">'
         '<div style="font-size:13px;color:#aaa;">'
-        'PCR &lt;0.5=Bearish | 0.5-0.8=Neutral-Bearish<br>'
-        'PCR 0.8-1.2=Neutral | 1.2-1.5=Bullish | &gt;1.5=Extremely Bullish'
+        'PCR &lt;0.5=Bearish | 0.5–0.8=Neutral-Bearish<br>'
+        'PCR 0.8–1.2=Neutral | 1.2–1.5=Bullish | &gt;1.5=Extremely Bullish'
         '</div></div>'.format(pcr_col, pcr, pcr_col, interp),
         unsafe_allow_html=True
     )
+
+st.divider()
+
+# ── Tomorrow's Prediction ─────────────────────────────────────────────────────
+st.markdown("### Tomorrow's Prediction")
+
+atm_iv = float(df.iloc[(df["strike"] - underlying).abs().idxmin()]["ce_iv"])
+if atm_iv == 0:
+    atm_iv = float(df["ce_iv"][df["ce_iv"] > 0].mean()) if (df["ce_iv"] > 0).any() else 15.0
+
+daily_move  = underlying * (atm_iv / 100) * math.sqrt(1 / 252)
+upper_level = underlying + daily_move
+lower_level = underlying - daily_move
+
+pain_diff   = max_pain - underlying
+bias_score  = sig["score"]
+if bias_score > 20:
+    direction, dir_color = "BULLISH", "#4CAF50"
+elif bias_score < -20:
+    direction, dir_color = "BEARISH", "#f44336"
+else:
+    direction, dir_color = "NEUTRAL", "#FF9800"
+
+tp1, tp2, tp3 = st.columns(3)
+
+with tp1:
+    st.markdown(
+        '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
+        '<div style="color:#aaa;font-size:13px;">Expected Daily Range (ATM IV = {}%)</div>'
+        '<div style="font-size:22px;font-weight:bold;color:#26a69a;margin:8px 0;">±₹{:,.0f}</div>'
+        '<div style="color:#ccc;font-size:14px;">Upper: <b>₹{:,.0f}</b></div>'
+        '<div style="color:#ccc;font-size:14px;">Lower: <b>₹{:,.0f}</b></div>'
+        '</div>'.format(round(atm_iv, 1), daily_move, upper_level, lower_level),
+        unsafe_allow_html=True
+    )
+
+with tp2:
+    st.markdown(
+        '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
+        '<div style="color:#aaa;font-size:13px;">Directional Bias</div>'
+        '<div style="font-size:32px;font-weight:bold;color:{};margin:8px 0;">{}</div>'
+        '<div style="color:#ccc;font-size:13px;">Score: {}</div>'
+        '<div style="color:#ccc;font-size:13px;">PCR: {}</div>'
+        '</div>'.format(dir_color, direction, bias_score, pcr),
+        unsafe_allow_html=True
+    )
+
+with tp3:
+    mp_dir  = "above" if pain_diff > 0 else "below"
+    mp_pull = "Upward pull" if pain_diff > 0 else "Downward pull"
+    st.markdown(
+        '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
+        '<div style="color:#aaa;font-size:13px;">Max Pain Magnet</div>'
+        '<div style="font-size:22px;font-weight:bold;color:#FFD700;margin:8px 0;">₹{:,.0f}</div>'
+        '<div style="color:#ccc;font-size:13px;">₹{:,.0f} {} spot</div>'
+        '<div style="color:#ccc;font-size:13px;">{}</div>'
+        '</div>'.format(max_pain, abs(pain_diff), mp_dir, mp_pull),
+        unsafe_allow_html=True
+    )
+
+st.markdown(
+    '<div style="background:#1e1e2e;padding:15px;border-radius:10px;margin-top:10px;">'
+    '<b style="color:#aaa;">Key Levels for Tomorrow</b><br>'
+    '<span style="color:#ef5350;">Resistance: ₹{:,.0f} (max CE OI)  |  Upper range: ₹{:,.0f}</span><br>'
+    '<span style="color:#26a69a;">Support: ₹{:,.0f} (max PE OI)  |  Lower range: ₹{:,.0f}</span><br>'
+    '<span style="color:#FFD700;">Max Pain: ₹{:,.0f}  |  Spot: ₹{:,.0f}</span>'
+    '</div>'.format(
+        sig["max_ce_resistance"], upper_level,
+        sig["max_pe_support"],    lower_level,
+        max_pain, underlying
+    ),
+    unsafe_allow_html=True
+)
 
 st.divider()
 
@@ -256,7 +387,7 @@ st.divider()
 st.markdown("#### Full Option Chain Table")
 tdf     = df.copy()
 atm_idx = (tdf["strike"] - underlying).abs().idxmin()
-tdf = tdf.rename(columns={
+tdf     = tdf.rename(columns={
     "ce_oi":"CE OI","ce_chg_oi":"CE Chg OI","ce_volume":"CE Vol",
     "ce_iv":"CE IV%","ce_ltp":"CE LTP","strike":"STRIKE",
     "pe_ltp":"PE LTP","pe_iv":"PE IV%","pe_volume":"PE Vol",
@@ -266,7 +397,7 @@ cols = ["CE OI","CE Chg OI","CE Vol","CE IV%","CE LTP","STRIKE","PE LTP","PE IV%
 tdf  = tdf[cols]
 
 def hl_atm(row):
-    return ["background-color:#2d2d00;font-weight:bold"]*len(row) if row.name==atm_idx else [""]*len(row)
+    return ["background-color:#2d2d00;font-weight:bold"]*len(row) if row.name == atm_idx else [""]*len(row)
 
 fmt = {
     "CE OI":"{:,.0f}","CE Chg OI":"{:,.0f}","CE Vol":"{:,.0f}",
@@ -277,7 +408,7 @@ fmt = {
 st.dataframe(tdf.style.apply(hl_atm, axis=1).format(fmt), use_container_width=True, height=400)
 
 st.markdown("---")
-st.caption("Data: NSE India  |  For educational purposes only. Not financial advice.")
+st.caption("Data: {}  |  For educational purposes only. Not financial advice.".format(source_tag))
 
 if auto_refresh:
     time.sleep(refresh_interval)
