@@ -15,8 +15,10 @@ import chat_bot
 import backtest
 import model_train
 
+APP_VERSION = "v2.2"
+
 st.set_page_config(
-    page_title="NSE Options Intelligence",
+    page_title="NSE Options Intelligence {}".format(APP_VERSION),
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -82,7 +84,7 @@ with st.sidebar:
     with col_t:
         test_mode = st.button("Test NSE", use_container_width=True)
 
-    st.caption("Updated: " + datetime.now().strftime("%H:%M:%S"))
+    st.caption("Updated: {}  |  {}".format(datetime.now().strftime("%H:%M:%S"), APP_VERSION))
 
 # ── Test NSE connection ───────────────────────────────────────────────────────
 if test_mode:
@@ -228,6 +230,23 @@ with tab_live:
     c3.metric("Max Pain",      "₹{:,.0f}".format(max_pain))
     c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
     c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+
+    # ── OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) ─
+    oi1, oi2, oi3, oi4, oi5 = st.columns(5)
+    call_sum_v = sig.get("call_sum", 0)
+    put_sum_v  = sig.get("put_sum", 0)
+    oi_diff_v  = sig.get("oi_difference", 0)
+    itm_r      = sig.get("itm_ratio", 0)
+    oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
+               delta="CE writing ↑" if call_sum_v > 0 else "CE covering ↓")
+    oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
+               delta="PE writing ↑" if put_sum_v > 0 else "PE covering ↓")
+    oi3.metric("OI Difference", "{:+.1f}K".format(oi_diff_v),
+               delta="Bearish" if oi_diff_v > 0 else "Bullish")
+    oi4.metric("ITM Ratio", "{:.2f}x".format(itm_r),
+               delta="Bullish" if itm_r > 1.5 else ("Bearish" if itm_r < 0.67 and itm_r > 0 else "Neutral"))
+    strat_type = sig.get("strategy_type", "WAIT")
+    oi5.metric("Suggested Strategy", strat_type)
     st.divider()
 
     sig_col, reason_col = st.columns([1, 2])
@@ -264,8 +283,8 @@ with tab_live:
         st.markdown("#### Analysis Breakdown")
         for r in sig["reasons"]:
             rl   = r.lower()
-            icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing"]) else \
-                   "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing"]) else "🟡"
+            icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
+                   "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "🟡"
             st.markdown(icon + " " + r)
         st.markdown("---")
         st.markdown("#### Key Levels")
@@ -273,6 +292,18 @@ with tab_live:
             "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
             "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
         }), hide_index=True, use_container_width=True)
+        st.markdown("---")
+        strat_note = sig.get("strategy_note", "")
+        if strat_note:
+            st.markdown("#### Strategy Recommendation")
+            strat_col = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
+                        "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;border-left:4px solid {};">'
+                '<b style="color:{};">{}</b><br><span style="color:#ccc;font-size:13px;">{}</span>'
+                '</div>'.format(strat_col, strat_col, strat_type, strat_note),
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
@@ -468,8 +499,11 @@ with tab_bt:
         if bt_mode.startswith("A"):
             st.markdown("### Signal Accuracy Backtest")
             st.markdown(
-                "Simulates SMA-crossover + momentum signals on {} daily candles "
-                "and checks if next-day direction was correct.".format(bt_days)
+                "Uses **RSI-14 + EMA-9/EMA-21 crossover + volume ratio** consensus "
+                "on {} daily candles. Signals fire only when 2+ indicators agree — "
+                "higher selectivity means fewer trades but better quality signals. "
+                "**Note:** Synthetic demo data is a random walk; near-50% win rate "
+                "on synthetic data is expected. Use Angel One for real results.".format(bt_days)
             )
             if st.button("Run Accuracy Backtest", type="primary", key="run_acc"):
                 with st.spinner("Running backtest…"):
@@ -477,11 +511,13 @@ with tab_bt:
                 if not metrics:
                     st.error("Not enough data (need ≥12 candles).")
                 else:
-                    m1, m2, m3, m4 = st.columns(4)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Win Rate",      "{}%".format(metrics["win_rate"]))
                     m2.metric("Call Accuracy", "{}%".format(metrics["call_accuracy"]))
                     m3.metric("Put Accuracy",  "{}%".format(metrics["put_accuracy"]))
                     m4.metric("Total Traded",  str(metrics["total_traded"]))
+                    m5.metric("Signal Rate",   "{}%".format(metrics.get("signal_rate", 0)),
+                               delta="of candles had signal")
 
                     fig_eq = go.Figure()
                     fig_eq.add_trace(go.Scatter(
@@ -615,11 +651,12 @@ with tab_bt:
         else:
             st.markdown("### Model Weight Calibration")
             st.markdown(
-                "Grid-search over scoring parameters to find weights that maximise "
-                "signal accuracy on historical candles."
+                "Grid-searches over RSI thresholds, volume confirmation, and minimum "
+                "indicator agreement (54 combinations) to find params that maximise "
+                "signal accuracy. Works best with **Angel One** live candle data."
             )
 
-            if st.button("Run Grid Search (576 combinations)", type="primary", key="run_calib"):
+            if st.button("Run Grid Search (54 combinations)", type="primary", key="run_calib"):
                 with st.spinner("Calibrating — scanning 576 parameter combinations…"):
                     st.session_state["_calib"] = model_train.calibrate_weights(candles)
 
@@ -839,8 +876,8 @@ with tab_pt:
 with tab_chat:
     st.markdown("## Chat with the Data")
     st.markdown(
-        "Ask questions about the current option chain data. "
-        "Type **help** for a full list of topics."
+        "Discuss the trade before you place it — ask for a **Trade Decision** or run "
+        "the **Scalping Checklist**, then drill into any detail."
     )
 
     try:
@@ -856,12 +893,75 @@ with tab_chat:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    # ── Timeframe selector ────────────────────────────────────────────────────
+    st.markdown("#### Select Timeframe")
+    tf_options = {
+        "5-min":  "5-min Scalp",
+        "15-min": "15-min Intraday",
+        "30-min": "30-min Swing",
+        "1-hr":   "1-hr Intraday",
+        "2-hr":   "2-hr Positional",
+        "daily":  "Daily Swing",
+    }
+    selected_tf = st.radio(
+        "Timeframe",
+        list(tf_options.keys()),
+        format_func=lambda k: tf_options[k],
+        index=3,  # default 1-hr
+        horizontal=True,
+        key="chat_tf",
+        label_visibility="collapsed",
+    )
+
+    tf_info = {
+        "5-min":  "10-15 min hold · SL 20% · Target 30% · Best: 9:20-10:00 AM",
+        "15-min": "45-60 min hold · SL 30% · Target 50% · Best: 9:30-11:30 AM",
+        "30-min": "1.5-2 hr hold  · SL 35% · Target 60% · Best: 9:45 AM-12:00 PM",
+        "1-hr":   "2-3 hr hold    · SL 40% · Target 65% · Best: 9:30-11:30 AM",
+        "2-hr":   "1-day hold     · SL 45% · Target 80% · Use credit spreads",
+        "daily":  "2-3 day hold   · SL 50% · Target 100% · Use next-week expiry",
+    }
+    st.caption("⏱ " + tf_info[selected_tf])
+
+    # ── Primary action buttons ────────────────────────────────────────────────
+    st.markdown("#### Start here:")
+    pa1, pa2 = st.columns(2)
+    if pa1.button(
+        "🎯 Get Trade Decision",
+        use_container_width=True,
+        type="primary",
+        key="pa_decision",
+        help="Full BUY/AVOID analysis with entry, stop-loss, and target",
+    ):
+        q = "trade decision"
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        a = chat_bot.answer(q, df, meta, sig, timeframe=selected_tf)
+        st.session_state.chat_history.append({"role": "assistant", "content": a})
+        st.rerun()
+
+    checklist_label = "📋 {} Checklist".format(tf_options[selected_tf])
+    if pa2.button(
+        checklist_label,
+        use_container_width=True,
+        type="secondary",
+        key="pa_scalp",
+        help="Dynamic pass/fail checklist for {}".format(tf_options[selected_tf]),
+    ):
+        q = "checklist"
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        a = chat_bot.answer(q, df, meta, sig, timeframe=selected_tf)
+        st.session_state.chat_history.append({"role": "assistant", "content": a})
+        st.rerun()
+
+    st.divider()
+
+    # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     user_input = st.chat_input(
-        "Ask about: signal, PCR, max pain, support/resistance, IV, tomorrow's prediction…"
+        "Ask: trade decision · checklist · signal · pcr · IV · tomorrow · help"
     )
     if user_input:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
@@ -869,23 +969,26 @@ with tab_chat:
             st.markdown(user_input)
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
-                answer = chat_bot.answer(user_input, df, meta, sig)
+                answer = chat_bot.answer(user_input, df, meta, sig,
+                                         timeframe=selected_tf)
             st.markdown(answer)
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
     st.markdown("---")
-    st.markdown("**Quick Questions:**")
+    st.markdown("**More quick questions:**")
     quick_qs = [
         ("Signal?",     "What is the current trade signal?"),
         ("PCR?",        "What is the put call ratio?"),
         ("Tomorrow?",   "What is tomorrow's prediction?"),
         ("Key Levels?", "What are the support and resistance levels?"),
+        ("IV?",         "What is the implied volatility?"),
+        ("OI?",         "Show me the open interest summary"),
     ]
     q_cols = st.columns(len(quick_qs))
     for i, (label, question) in enumerate(quick_qs):
         if q_cols[i].button(label, use_container_width=True, key="qq_{}".format(i)):
             st.session_state.chat_history.append({"role": "user", "content": question})
-            answer = chat_bot.answer(question, df, meta, sig)
+            answer = chat_bot.answer(question, df, meta, sig, timeframe=selected_tf)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             st.rerun()
 
