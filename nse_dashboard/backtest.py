@@ -57,9 +57,10 @@ def _make_signal(row, params):
         score += params.get("trend_score", 10)
     else:
         score -= params.get("trend_score", 10)
-    if row["pct_chg"] > 0.3:
+    mom_thresh = params.get("mom_threshold", 0.3)
+    if row["pct_chg"] > mom_thresh:
         score += params.get("mom_score", 10)
-    elif row["pct_chg"] < -0.3:
+    elif row["pct_chg"] < -mom_thresh:
         score -= params.get("mom_score", 10)
     threshold = params.get("signal_threshold", 15)
     if score > threshold:
@@ -280,16 +281,19 @@ def update_forward_outcomes(candles):
 # ── Weight calibration ────────────────────────────────────────────────────────
 
 def load_weights():
+    defaults = {
+        "sma_score": 15, "trend_score": 10, "mom_score": 10,
+        "signal_threshold": 15, "mom_threshold": 0.3,
+    }
     if os.path.exists(_WEIGHTS_FILE):
         try:
             with open(_WEIGHTS_FILE) as f:
-                return json.load(f)
+                saved = json.load(f)
+            if isinstance(saved, dict) and "sma_score" in saved:
+                defaults.update(saved)
         except Exception:
             pass
-    return {
-        "sma_score": 15, "trend_score": 10, "mom_score": 10,
-        "signal_threshold": 15,
-    }
+    return defaults
 
 def save_weights(weights):
     try:
