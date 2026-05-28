@@ -839,8 +839,8 @@ with tab_pt:
 with tab_chat:
     st.markdown("## Chat with the Data")
     st.markdown(
-        "Ask questions about the current option chain data. "
-        "Type **help** for a full list of topics."
+        "Discuss the trade before you place it — ask for a **Trade Decision** or run "
+        "the **Scalping Checklist**, then drill into any detail."
     )
 
     try:
@@ -856,12 +856,44 @@ with tab_chat:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    # ── Primary action buttons ────────────────────────────────────────────────
+    st.markdown("#### Start here:")
+    pa1, pa2 = st.columns(2)
+    if pa1.button(
+        "🎯 Get Trade Decision",
+        use_container_width=True,
+        type="primary",
+        key="pa_decision",
+        help="Full BUY/AVOID analysis with entry, stop-loss, and target",
+    ):
+        q = "trade decision"
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        a = chat_bot.answer(q, df, meta, sig)
+        st.session_state.chat_history.append({"role": "assistant", "content": a})
+        st.rerun()
+
+    if pa2.button(
+        "📋 Scalping Checklist (1-hr)",
+        use_container_width=True,
+        type="secondary",
+        key="pa_scalp",
+        help="Dynamic pass/fail checklist for intraday 1-hour scalp trades",
+    ):
+        q = "scalping checklist"
+        st.session_state.chat_history.append({"role": "user", "content": q})
+        a = chat_bot.answer(q, df, meta, sig)
+        st.session_state.chat_history.append({"role": "assistant", "content": a})
+        st.rerun()
+
+    st.divider()
+
+    # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     user_input = st.chat_input(
-        "Ask about: signal, PCR, max pain, support/resistance, IV, tomorrow's prediction…"
+        "Ask: trade decision · scalping checklist · signal · pcr · IV · tomorrow · help"
     )
     if user_input:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
@@ -874,12 +906,14 @@ with tab_chat:
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
     st.markdown("---")
-    st.markdown("**Quick Questions:**")
+    st.markdown("**More quick questions:**")
     quick_qs = [
         ("Signal?",     "What is the current trade signal?"),
         ("PCR?",        "What is the put call ratio?"),
         ("Tomorrow?",   "What is tomorrow's prediction?"),
         ("Key Levels?", "What are the support and resistance levels?"),
+        ("IV?",         "What is the implied volatility?"),
+        ("OI?",         "Show me the open interest summary"),
     ]
     q_cols = st.columns(len(quick_qs))
     for i, (label, question) in enumerate(quick_qs):

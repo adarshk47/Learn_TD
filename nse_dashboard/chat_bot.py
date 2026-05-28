@@ -11,7 +11,9 @@ Two modes:
 
 from __future__ import annotations
 
+import math
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -29,14 +31,12 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def _fmt(val: float, decimals: int = 2) -> str:
-    """Format a number with thousand separators."""
     if decimals == 0:
         return "{:,.0f}".format(val)
     return "{:,.{}f}".format(val, decimals)
 
 
 def _top_oi_strikes(df: pd.DataFrame, col: str, n: int = 3) -> list:
-    """Return top-n strikes sorted by OI column descending."""
     if df.empty or col not in df.columns:
         return []
     top = df.nlargest(n, col)[["strike", col]]
@@ -44,7 +44,6 @@ def _top_oi_strikes(df: pd.DataFrame, col: str, n: int = 3) -> list:
 
 
 def _atm_iv(df: pd.DataFrame, underlying: float) -> tuple:
-    """Return (ce_iv, pe_iv) for the ATM strike."""
     if df.empty:
         return 0.0, 0.0
     try:
@@ -55,12 +54,320 @@ def _atm_iv(df: pd.DataFrame, underlying: float) -> tuple:
         return 0.0, 0.0
 
 
+def _atm_ltp(df: pd.DataFrame, underlying: float) -> tuple:
+    """Return (ce_ltp, pe_ltp) for the ATM strike."""
+    if df.empty:
+        return 0.0, 0.0
+    try:
+        idx = (df["strike"] - underlying).abs().idxmin()
+        row = df.iloc[idx]
+        return _safe_float(row.get("ce_ltp", 0)), _safe_float(row.get("pe_ltp", 0))
+    except Exception:
+        return 0.0, 0.0
+
+
+# ── Trade Decision ────────────────────────────────────────────────────────────
+
+def _trade_decision(df: pd.DataFrame, meta: dict, sig: dict) -> str:
+    """
+    Comprehensive trade decision synthesising all available option chain data.
+    Gives a clear BUY CALL / BUY PUT / AVOID recommendation with entry, SL, target.
+    """
+    underlying = _safe_float(meta.get("underlying", 0))
+    expiry     = meta.get("expiry", "N/A")
+    atm        = _safe_float(meta.get("atm", underlying))
+    pcr        = _safe_float(sig.get("pcr", 0))
+    max_pain   = _safe_float(sig.get("max_pain", 0))
+    signal     = sig.get("signal", "N/A")
+    confidence = _safe_float(sig.get("confidence", 0))
+    score      = _safe_float(sig.get("score", 0))
+    reasons    = sig.get("reasons", [])
+    ce_res     = _safe_float(sig.get("max_ce_resistance", 0))
+    pe_sup     = _safe_float(sig.get("max_pe_support", 0))
+    symbol     = meta.get("symbol", "INDEX")
+
+    ce_iv, pe_iv = _atm_iv(df, underlying)
+    avg_iv       = (ce_iv + pe_iv) / 2 if (ce_iv + pe_iv) > 0 else 15.0
+    ce_ltp, pe_ltp = _atm_ltp(df, underlying)
+
+    # ── Signal header ─────────────────────────────────────────────────────────
+    if signal == "BUY CALL":
+        sig_icon   = "🟢"
+        action     = "BUY CALL"
+        ltp        = ce_ltp if ce_ltp > 0 else underlying * 0.008
+        hedge      = "Consider buying 1-OTM PE as hedge if holding > 30 min"
+    elif signal == "BUY PUT":
+        sig_icon   = "🔴"
+        action     = "BUY PUT"
+        ltp        = pe_ltp if pe_ltp > 0 else underlying * 0.008
+        hedge      = "Consider buying 1-OTM CE as hedge if holding > 30 min"
+    else:
+        sig_icon   = "🟡"
+        action     = "AVOID / WAIT"
+        ltp        = max(ce_ltp, pe_ltp, underlying * 0.006)
+        hedge      = "No directional trade recommended right now"
+
+    sl_pct  = 0.40
+    tgt_pct = 0.55
+    sl_price  = round(ltp * (1 - sl_pct), 1) if ltp > 0 else 0
+    tgt1      = round(ltp * (1 + tgt_pct), 1) if ltp > 0 else 0
+    tgt2      = round(ltp * (1 + tgt_pct + 0.20), 1) if ltp > 0 else 0
+
+    # ── Individual checks ──────────────────────────────────────────────────────
+    chk_pcr     = "✅" if (signal == "BUY CALL" and pcr > 1.1) or (signal == "BUY PUT" and pcr < 0.9) else \
+                  "⚠️" if 0.9 <= pcr <= 1.1 else "❌"
+    pain_diff   = max_pain - underlying
+    chk_pain    = "✅" if (signal == "BUY CALL" and pain_diff > 0) or \
+                         (signal == "BUY PUT"  and pain_diff < 0) else \
+                  "⚠️" if abs(pain_diff) / max(underlying, 1) < 0.003 else "❌"
+    chk_iv      = "✅" if avg_iv < 14 else "⚠️" if avg_iv < 22 else "❌"
+
+    room_to_res = (ce_res - underlying) / max(underlying, 1) * 100
+    room_to_sup = (underlying - pe_sup) / max(underlying, 1) * 100
+    chk_res     = "✅" if room_to_res > 0.5 else "⚠️" if room_to_res > 0.2 else "❌"
+    chk_sup     = "✅" if room_to_sup > 0.3 else "⚠️" if room_to_sup > 0.1 else "❌"
+    chk_conf    = "✅" if confidence >= 65 else "⚠️" if confidence >= 50 else "❌"
+
+    iv_note  = "Low IV — cheap premiums ✅" if avg_iv < 14 else \
+               "Moderate IV — fair entry ⚠️" if avg_iv < 22 else \
+               "High IV — expensive, prefer selling ❌"
+
+    pain_dir = "above" if pain_diff > 0 else "below"
+    pain_pull = "upward" if pain_diff > 0 else "downward"
+
+    # ── Overall verdict ───────────────────────────────────────────────────────
+    good = sum(1 for c in [chk_pcr, chk_pain, chk_iv, chk_res, chk_sup, chk_conf] if c == "✅")
+    warn = sum(1 for c in [chk_pcr, chk_pain, chk_iv, chk_res, chk_sup, chk_conf] if c == "⚠️")
+    if good >= 4:
+        verdict = "🟢 **GO — conditions favour this trade**"
+    elif good >= 2 and warn <= 2:
+        verdict = "🟡 **CAUTION — mixed signals, size down**"
+    else:
+        verdict = "🔴 **WAIT — too many checks failing**"
+
+    lines = [
+        "## 🎯 Trade Decision — {}".format(symbol),
+        "",
+        "{} **Signal: {} ({}% confidence)**".format(sig_icon, action, int(confidence)),
+        "",
+        "---",
+        "### Signal Checks",
+        "{} **PCR: {}** → {}".format(
+            chk_pcr, _fmt(pcr),
+            "Bullish (>1.1 put writing)" if pcr > 1.1 else
+            "Bearish (<0.9 call writing)" if pcr < 0.9 else "Neutral (0.9–1.1)"
+        ),
+        "{} **Max Pain: ₹{}** — ₹{:,.0f} {} spot ({} pull at expiry)".format(
+            chk_pain, _fmt(max_pain, 0), abs(pain_diff), pain_dir, pain_pull
+        ),
+        "{} **Confidence: {}%** ({})".format(
+            chk_conf, int(confidence),
+            "Strong" if confidence >= 65 else "Moderate" if confidence >= 50 else "Weak"
+        ),
+        "{} **IV: {:.1f}%** — {}".format(chk_iv, avg_iv, iv_note),
+        "{} **Resistance room: {:.1f}%** to ₹{} CE wall".format(chk_res, room_to_res, int(ce_res)),
+        "{} **Support room: {:.1f}%** above ₹{} PE floor".format(chk_sup, room_to_sup, int(pe_sup)),
+        "",
+        "**Overall: {} — {}/{} checks pass**".format(verdict, good, 6),
+        "",
+        "---",
+        "### Trade Setup" + (" (ATM {})".format("CE" if signal == "BUY CALL" else "PE") if signal != "AVOID / WAIT" else ""),
+        "| | |",
+        "|---|---|",
+        "| Spot | ₹{} |".format(_fmt(underlying)),
+        "| ATM Strike | ₹{} |".format(_fmt(atm, 0)),
+        "| Est. Premium | ₹{:.1f} |".format(ltp) if ltp > 0 else "| Est. Premium | — |",
+        "| Stop-loss | ₹{:.1f} (−40%) |".format(sl_price) if sl_price > 0 else "| Stop-loss | — |",
+        "| Target 1 | ₹{:.1f} (+55%) |".format(tgt1) if tgt1 > 0 else "| Target 1 | — |",
+        "| Target 2 | ₹{:.1f} (+75%) |".format(tgt2) if tgt2 > 0 else "| Target 2 | — |",
+        "| Expiry | {} |".format(expiry),
+        "",
+        "💡 {}".format(hedge),
+        "",
+        "---",
+        "### Reasons Behind Signal",
+    ]
+    for r in reasons:
+        lines.append("• " + r)
+
+    lines += [
+        "",
+        "---",
+        "⏰ **Best intraday windows:** 9:20–10:30 AM · 1:30–3:00 PM IST",
+        "📏 **Position sizing:** 1 lot per ₹50,000 deployed capital",
+        "⚠️ Educational only — not financial advice. Always use a stop-loss.",
+    ]
+    return "\n".join(lines)
+
+
+# ── Scalping Checklist ────────────────────────────────────────────────────────
+
+def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
+    """
+    Dynamic pass/fail checklist for intraday 1-hour scalping trades.
+    Checks what can be derived from option chain data; flags manual checks.
+    """
+    underlying = _safe_float(meta.get("underlying", 0))
+    atm        = _safe_float(meta.get("atm", underlying))
+    pcr        = _safe_float(sig.get("pcr", 0))
+    max_pain   = _safe_float(sig.get("max_pain", 0))
+    signal     = sig.get("signal", "N/A")
+    confidence = _safe_float(sig.get("confidence", 0))
+    ce_res     = _safe_float(sig.get("max_ce_resistance", 0))
+    pe_sup     = _safe_float(sig.get("max_pe_support", 0))
+    symbol     = meta.get("symbol", "INDEX")
+
+    ce_iv, pe_iv = _atm_iv(df, underlying)
+    avg_iv       = (ce_iv + pe_iv) / 2 if (ce_iv + pe_iv) > 0 else 15.0
+    ce_ltp, pe_ltp = _atm_ltp(df, underlying)
+
+    # OI buildup near ATM
+    if not df.empty:
+        atm_idx  = (df["strike"] - underlying).abs().idxmin()
+        near     = df.iloc[max(0, atm_idx - 3): atm_idx + 4]
+        net_chg  = near["pe_chg_oi"].sum() - near["ce_chg_oi"].sum()
+        atm_oi_bias = "PE writing (bullish)" if net_chg > 0 else \
+                      "CE writing (bearish)" if net_chg < 0 else "Neutral"
+        atm_oi_ok = "✅" if (signal == "BUY CALL" and net_chg > 0) or \
+                            (signal == "BUY PUT"  and net_chg < 0) else "⚠️"
+    else:
+        atm_oi_bias = "N/A"
+        atm_oi_ok   = "⚠️"
+
+    # ATM liquidity (OI > 50k is decent)
+    atm_ce_oi = 0.0
+    atm_pe_oi = 0.0
+    if not df.empty:
+        try:
+            idx = (df["strike"] - underlying).abs().idxmin()
+            atm_ce_oi = _safe_float(df.iloc[idx].get("ce_oi", 0))
+            atm_pe_oi = _safe_float(df.iloc[idx].get("pe_oi", 0))
+        except Exception:
+            pass
+    liq_oi = atm_ce_oi if signal == "BUY CALL" else atm_pe_oi
+    chk_liq = "✅" if liq_oi > 50000 else "⚠️" if liq_oi > 10000 else "❌"
+    liq_note = "{:,.0f} lots at ATM".format(liq_oi)
+
+    room_to_res = (ce_res - underlying) / max(underlying, 1) * 100
+    room_to_sup = (underlying - pe_sup) / max(underlying, 1) * 100
+    pain_diff   = max_pain - underlying
+
+    chk_sig  = "✅" if confidence >= 65 else "⚠️" if confidence >= 50 else "❌"
+    chk_pcr  = "✅" if (signal == "BUY CALL" and pcr > 1.1) or \
+                       (signal == "BUY PUT"  and pcr < 0.9) else \
+               "⚠️" if 0.9 <= pcr <= 1.1 else "❌"
+    chk_pain = "✅" if (signal == "BUY CALL" and pain_diff > 0) or \
+                       (signal == "BUY PUT"  and pain_diff < 0) else \
+               "⚠️" if abs(pain_diff) / max(underlying, 1) < 0.003 else "❌"
+    chk_iv   = "✅" if avg_iv < 14 else "⚠️" if avg_iv < 22 else "❌"
+    chk_res  = "✅" if room_to_res > 0.5 else "⚠️" if room_to_res > 0.2 else "❌"
+    chk_sup  = "✅" if room_to_sup > 0.3 else "⚠️" if room_to_sup > 0.1 else "❌"
+
+    auto_checks = [chk_sig, chk_pcr, chk_pain, chk_iv, chk_res, chk_sup, atm_oi_ok, chk_liq]
+    passed      = sum(1 for c in auto_checks if c == "✅")
+    total       = len(auto_checks)
+
+    if passed >= 6:
+        verdict = "🟢 **GREEN LIGHT** — {}/{} auto-checks pass".format(passed, total)
+    elif passed >= 4:
+        verdict = "🟡 **CAUTION** — {}/{} pass, review warnings".format(passed, total)
+    else:
+        verdict = "🔴 **WAIT** — only {}/{} pass, skip this setup".format(passed, total)
+
+    # Preferred instrument for scalp
+    if signal == "BUY CALL":
+        instr = "ATM CE → ₹{} CE  (LTP ≈ ₹{:.1f})".format(int(atm), ce_ltp) if ce_ltp > 0 else "ATM CE"
+    elif signal == "BUY PUT":
+        instr = "ATM PE → ₹{} PE  (LTP ≈ ₹{:.1f})".format(int(atm), pe_ltp) if pe_ltp > 0 else "ATM PE"
+    else:
+        instr = "No directional trade — WAIT"
+
+    ref_ltp = (ce_ltp if signal == "BUY CALL" else pe_ltp) if signal != "AVOID / WAIT" else 0
+    sl_ltp  = round(ref_ltp * 0.60, 1) if ref_ltp > 0 else 0
+    tgt_ltp = round(ref_ltp * 1.55, 1) if ref_ltp > 0 else 0
+
+    lines = [
+        "## 📋 Scalping Checklist — {} (1-Hour Intraday)".format(symbol),
+        "",
+        verdict,
+        "",
+        "---",
+        "### Auto Checks (from live data)",
+        "",
+        "**Direction & Signal**",
+        "{} Signal: **{}** · Confidence {}%".format(chk_sig, signal, int(confidence)),
+        "{} PCR: **{}** → {}".format(
+            chk_pcr, _fmt(pcr),
+            "Bullish" if pcr > 1.1 else "Bearish" if pcr < 0.9 else "Neutral"
+        ),
+        "{} Max Pain: **₹{}** {} spot → {} pull".format(
+            chk_pain, _fmt(max_pain, 0),
+            "above" if pain_diff > 0 else "below",
+            "upward" if pain_diff > 0 else "downward"
+        ),
+        "{} ATM OI buildup: **{}**".format(atm_oi_ok, atm_oi_bias),
+        "",
+        "**Options Pricing**",
+        "{} IV: **{:.1f}%** — {}".format(
+            chk_iv, avg_iv,
+            "cheap, good to buy" if avg_iv < 14 else
+            "fair value" if avg_iv < 22 else "expensive, prefer selling"
+        ),
+        "{} Liquidity: **{}**".format(chk_liq, liq_note),
+        "",
+        "**Risk / Room**",
+        "{} Resistance: ₹{} CE wall — **{:.1f}% headroom**".format(chk_res, int(ce_res), room_to_res),
+        "{} Support: ₹{} PE floor — **{:.1f}% below**".format(chk_sup, int(pe_sup), room_to_sup),
+        "",
+        "---",
+        "### Manual Checks (do these on your chart)",
+        "",
+        "⬜ **15-min chart:** Close above 20-EMA? (calls) / Below? (puts)",
+        "⬜ **15-min RSI:** > 55 for calls · < 45 for puts",
+        "⬜ **Volume:** Current candle volume > 3-bar average?",
+        "⬜ **1-hr trend:** Higher highs & higher lows (calls) / Lower lows (puts)?",
+        "⬜ **No events:** Any RBI, GDP, earnings, or major news next 2 hours?",
+        "⬜ **Time window:** Are you in 9:20–10:30 AM or 1:30–3:00 PM IST?",
+        "",
+        "---",
+        "### Trade Parameters",
+        "",
+        "| | |",
+        "|---|---|",
+        "| Instrument | {} |".format(instr),
+        "| Stop-loss | ₹{:.1f} (−40% of premium) |".format(sl_ltp) if sl_ltp > 0 else "| Stop-loss | 40% of your entry premium |",
+        "| Target | ₹{:.1f} (+55%) |".format(tgt_ltp) if tgt_ltp > 0 else "| Target | 55% gain on premium |",
+        "| Max hold | 1 hour / 3:15 PM |",
+        "| Lot rule | 1 lot per ₹50,000 capital |",
+        "| R:R | 1 : 1.4 (40% SL, 55% target) |",
+        "",
+        "---",
+        "### What to check for scalping (theory)",
+        "",
+        "**Price action:**",
+        "• Breakout of previous 15-min high (for calls) or low (for puts)",
+        "• Strong close candle — not a doji or inside bar",
+        "",
+        "**Options-specific:**",
+        "• Prefer ATM strikes — tightest spreads, best delta",
+        "• Avoid 30+ mins before expiry — gamma explosion risk",
+        "• Watch bid-ask spread: > ₹5 gap at ATM = avoid (low liquidity)",
+        "• Rising OI + rising LTP = fresh buildup (strong signal)",
+        "• Falling OI + rising LTP = short covering (weaker signal)",
+        "",
+        "**Risk management:**",
+        "• Never risk > 2% of capital on one scalp",
+        "• Exit at SL without hesitation — no averaging down in options",
+        "• Bank partial profit at Target 1, trail the rest",
+        "",
+        "⚠️ Educational only — not financial advice.",
+    ]
+    return "\n".join(lines)
+
+
 # ── Keyword-based answers ─────────────────────────────────────────────────────
 
 def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
-    """
-    Match query against keyword topics and return a formatted string answer.
-    """
     q = query.lower().strip()
 
     underlying = _safe_float(meta.get("underlying", 0))
@@ -74,6 +381,21 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
     reasons    = sig.get("reasons", [])
     ce_res     = _safe_float(sig.get("max_ce_resistance", 0))
     pe_sup     = _safe_float(sig.get("max_pe_support", 0))
+
+    # ── Trade decision ────────────────────────────────────────────────────────
+    if any(w in q for w in [
+        "trade decision", "should i buy", "should i sell", "should i trade",
+        "trade recommendation", "entry", "go long", "go short",
+        "buy or sell", "call or put", "decision",
+    ]):
+        return _trade_decision(df, meta, sig)
+
+    # ── Scalping / intraday checklist ─────────────────────────────────────────
+    if any(w in q for w in [
+        "scalp", "scalping", "intraday", "1 hour", "one hour", "checklist",
+        "what to check", "before trade", "pre trade", "pre-trade",
+    ]):
+        return _scalping_checklist(df, meta, sig)
 
     # ── Signal / trade ────────────────────────────────────────────────────────
     if any(w in q for w in ["signal", "buy", "sell", "trade", "recommend"]):
@@ -175,8 +497,6 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
         ce_iv, pe_iv = _atm_iv(df, underlying)
         avg_iv = (ce_iv + pe_iv) / 2 if (ce_iv + pe_iv) > 0 else 0
 
-        # Expected daily move
-        import math
         daily_move = underlying * (avg_iv / 100) * math.sqrt(1 / 252) if avg_iv > 0 else 0
 
         level = "LOW (cheap premiums)" if avg_iv < 12 else \
@@ -195,7 +515,6 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
 
     # ── Tomorrow prediction ───────────────────────────────────────────────────
     if any(w in q for w in ["tomorrow", "predict", "next day", "forecast", "direction"]):
-        import math
         ce_iv, pe_iv = _atm_iv(df, underlying)
         avg_iv       = (ce_iv + pe_iv) / 2 if (ce_iv + pe_iv) > 0 else 15.0
         daily_move   = underlying * (avg_iv / 100) * math.sqrt(1 / 252)
@@ -275,6 +594,10 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
         return (
             "**NSE Options Bot — Available Topics**\n\n"
             "Ask me about any of these:\n\n"
+            "🎯 **trade decision** / should I buy / entry\n"
+            "   → Full BUY/AVOID recommendation with entry, SL, target\n\n"
+            "📋 **scalping** / intraday / checklist\n"
+            "   → Dynamic pass/fail checklist for 1-hour intraday trades\n\n"
             "📊 **signal** / trade / buy / sell\n"
             "   → Current signal with reasons\n\n"
             "📉 **pcr** / put call ratio\n"
@@ -302,9 +625,9 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
         "Signal: {} ({}% confidence)\n"
         "PCR: {}  |  Max Pain: ₹{}\n"
         "CE Resistance: ₹{}  |  PE Support: ₹{}\n\n"
-        "I can answer questions about: **signal, pcr, max pain, resistance, "
-        "support, IV/volatility, tomorrow's prediction, open interest**.\n"
-        "Type **help** for the full topic list."
+        "Ask: **trade decision** (full analysis) · **scalping checklist** · "
+        "**signal** · **pcr** · **max pain** · **IV** · **tomorrow**\n"
+        "Type **help** for all topics."
     ).format(
         meta.get("symbol", "INDEX"),
         _fmt(underlying), _fmt(atm, 0), expiry,
@@ -317,7 +640,6 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
 # ── Claude API answer ─────────────────────────────────────────────────────────
 
 def _build_context(df: pd.DataFrame, meta: dict, sig: dict) -> str:
-    """Build a compact context string from live option chain data."""
     underlying = _safe_float(meta.get("underlying", 0))
     expiry     = meta.get("expiry", "N/A")
     atm        = _safe_float(meta.get("atm", underlying))
@@ -331,6 +653,7 @@ def _build_context(df: pd.DataFrame, meta: dict, sig: dict) -> str:
     reasons    = sig.get("reasons", [])
 
     ce_iv, pe_iv = _atm_iv(df, underlying)
+    ce_ltp, pe_ltp = _atm_ltp(df, underlying)
 
     top_ce = _top_oi_strikes(df, "ce_oi", 3)
     top_pe = _top_oi_strikes(df, "pe_oi", 3)
@@ -345,7 +668,9 @@ def _build_context(df: pd.DataFrame, meta: dict, sig: dict) -> str:
         "PCR: {} | MaxPain: {} | CE_Res: {} | PE_Sup: {}".format(
             _fmt(pcr), _fmt(max_pain, 0), _fmt(ce_res, 0), _fmt(pe_sup, 0)
         ),
-        "ATM IV — CE: {:.1f}% PE: {:.1f}%".format(ce_iv, pe_iv),
+        "ATM IV — CE: {:.1f}% PE: {:.1f}%  |  ATM LTP — CE: ₹{:.1f} PE: ₹{:.1f}".format(
+            ce_iv, pe_iv, ce_ltp, pe_ltp
+        ),
         "Reasons: " + "; ".join(reasons),
         "Top CE OI strikes: " + ", ".join(
             "₹{}={:,.0f}".format(int(s), o) for s, o in top_ce
@@ -364,13 +689,8 @@ def _claude_answer(
     sig: dict,
     api_key: str,
 ) -> str:
-    """
-    Call the Anthropic Claude API (claude-haiku-4-5-20251001) and return the response.
-
-    Falls back to keyword answer if the API call fails.
-    """
     try:
-        import anthropic  # type: ignore
+        import anthropic
 
         context = _build_context(df, meta, sig)
 
@@ -378,11 +698,14 @@ def _claude_answer(
 
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+            max_tokens=600,
             system=(
                 "You are an NSE options markets expert assistant. "
                 "Answer questions using only the provided option chain data context. "
                 "Be concise, factual and educational. "
+                "For trade decision / entry questions, give a clear BUY CALL / BUY PUT / AVOID "
+                "recommendation with entry, stop-loss, and target levels. "
+                "For scalping / intraday questions, provide a structured checklist. "
                 "Always remind the user this is for educational purposes only and not financial advice. "
                 "Use ₹ symbol for Indian Rupees."
             ),
@@ -403,10 +726,8 @@ def _claude_answer(
         return response_text
 
     except ImportError:
-        # anthropic package not installed → keyword fallback
         return _keyword_answer(query, df, meta, sig)
     except Exception:
-        # Any API error → keyword fallback
         return _keyword_answer(query, df, meta, sig)
 
 
@@ -414,34 +735,19 @@ def _claude_answer(
 
 def answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
     """
-    Main entry point for the chat bot.
-
-    Tries Claude API first if `anthropic_api_key` is available in st.secrets,
-    otherwise uses keyword-based matching.
-
-    Parameters
-    ----------
-    query : str         — user's natural language question
-    df    : pd.DataFrame — current option chain DataFrame
-    meta  : dict         — metadata from parse_option_chain (underlying, expiry, atm …)
-    sig   : dict         — signal dict from generate_signal (pcr, max_pain, signal …)
-
-    Returns
-    -------
-    str — markdown-formatted answer
+    Main entry point. Tries Claude API first if anthropic_api_key is in
+    st.secrets, otherwise uses keyword-based matching.
     """
     if not query or not query.strip():
-        return "Please ask a question about the option chain data. Type **help** for topics."
+        return "Please ask a question. Type **help** for topics, or ask for a **trade decision**."
 
-    # Enrich meta with symbol if not already set
     if "symbol" not in meta:
         meta = dict(meta)
         meta["symbol"] = "INDEX"
 
-    # Try Streamlit secrets for API key
     api_key: str | None = None
     try:
-        import streamlit as st  # type: ignore
+        import streamlit as st
         api_key = st.secrets.get("anthropic_api_key", None)
     except Exception:
         pass
