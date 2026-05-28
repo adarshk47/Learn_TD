@@ -147,11 +147,29 @@ def calculate_max_pain(df):
     return best
 
 
+def _strategy_for_conviction(score, confidence):
+    """
+    Map conviction level to recommended options strategy.
+    Based on JUDAH-Nifty-Oracle research (83.4% iron condor, 79.2% spread, 74.8% naked).
+    """
+    abs_score = abs(score)
+    if abs_score >= 45 and confidence >= 70:
+        return "ATM Option Buy", "High conviction — buy ATM CE/PE outright (74.8% hist win rate)"
+    elif abs_score >= 30 and confidence >= 60:
+        return "Credit Spread", "Moderate conviction — Bull Put Spread / Bear Call Spread (79.2% hist win rate)"
+    elif abs_score >= 15:
+        return "Debit Spread", "Low-moderate conviction — cheaper spread; defined risk"
+    else:
+        return "Iron Condor", "Neutral market — sell both sides for theta decay (83.4% hist win rate)"
+
+
 def generate_signal(df, meta):
     empty = {
         "signal": "NO DATA", "confidence": 0, "reasons": [],
         "color": "orange", "pcr": 0, "max_pain": 0,
         "max_ce_resistance": 0, "max_pe_support": 0, "score": 0,
+        "call_sum": 0, "put_sum": 0, "oi_difference": 0, "itm_ratio": 0,
+        "strategy_type": "WAIT", "strategy_note": "",
     }
     if df.empty:
         return empty
@@ -162,6 +180,7 @@ def generate_signal(df, meta):
     score      = 0
     reasons    = []
 
+    # ── PCR ───────────────────────────────────────────────────────────────────
     if pcr > 1.2:
         score += 25; reasons.append("PCR={} (Bullish — high put writing)".format(pcr))
     elif pcr > 0.8:
@@ -171,6 +190,7 @@ def generate_signal(df, meta):
     else:
         score -= 10; reasons.append("PCR={} (Neutral-Bearish)".format(pcr))
 
+    # ── Max pain pull ─────────────────────────────────────────────────────────
     pain_pct = ((max_pain - underlying) / underlying * 100) if underlying else 0
     if pain_pct > 0.3:
         score += 20; reasons.append("Max Pain {} above spot (upward pull)".format(int(max_pain)))
@@ -179,23 +199,67 @@ def generate_signal(df, meta):
     else:
         reasons.append("Max Pain {} near spot (neutral)".format(int(max_pain)))
 
-    atm_idx = (df["strike"] - underlying).abs().idxmin()
-    near    = df.iloc[max(0, atm_idx - 3): atm_idx + 4]
-    net_chg = near["pe_chg_oi"].sum() - near["ce_chg_oi"].sum()
-    if net_chg > 0:
-        score += 15; reasons.append("Fresh PE writing near ATM (support building)")
-    elif net_chg < 0:
-        score -= 15; reasons.append("Fresh CE writing near ATM (resistance building)")
+    # ── 3-strike OI sum (VarunS2002 approach — most reliable intraday signal) ─
+    # call_sum < put_sum → more put writing → bullish
+    atm_idx  = (df["strike"] - underlying).abs().idxmin()
+    near3    = df.iloc[max(0, atm_idx - 1): min(len(df), atm_idx + 2)]
+    call_sum = round(near3["ce_chg_oi"].sum() / 1000, 1)   # in thousands
+    put_sum  = round(near3["pe_chg_oi"].sum() / 1000, 1)
+    oi_diff  = round(call_sum - put_sum, 1)                  # negative = bullish
 
-    ce_sum = df["ce_oi"].sum()
-    pe_sum = df["pe_oi"].sum()
-    max_ce = df.loc[df["ce_oi"].idxmax(), "strike"] if ce_sum > 0 else underlying
-    max_pe = df.loc[df["pe_oi"].idxmax(), "strike"] if pe_sum > 0 else underlying
+    if put_sum > call_sum:
+        score += 15; reasons.append(
+            "OI Buildup: Put Sum ({:+.0f}K) > Call Sum ({:+.0f}K) near ATM — bullish support".format(
+                put_sum * 1000, call_sum * 1000))
+    elif call_sum > put_sum:
+        score -= 15; reasons.append(
+            "OI Buildup: Call Sum ({:+.0f}K) > Put Sum ({:+.0f}K) near ATM — bearish resistance".format(
+                call_sum * 1000, put_sum * 1000))
+
+    # ── OI Boundary signals (strike 2 above / below ATM — reversal warning) ──
+    call_boundary_idx = min(len(df) - 1, atm_idx + 2)
+    put_boundary_idx  = max(0, atm_idx - 1)
+    call_boundary_oi  = df.iloc[call_boundary_idx]["ce_chg_oi"]
+    put_boundary_oi   = df.iloc[put_boundary_idx]["pe_chg_oi"]
+
+    if call_boundary_oi < 0:
+        score += 5
+        reasons.append("Call boundary OI unwinding at upper strike (calls being covered)")
+    if put_boundary_oi < 0:
+        score -= 5
+        reasons.append("Put boundary OI unwinding at lower strike (puts being covered)")
+
+    # ── ITM ratio — put chg vs call chg (ratio > 1.5 = strong bullish) ───────
+    total_ce_chg = df["ce_chg_oi"].sum()
+    total_pe_chg = df["pe_chg_oi"].sum()
+    if total_ce_chg > 0 and total_pe_chg > 0:
+        itm_ratio = round(total_pe_chg / total_ce_chg, 2)
+        if itm_ratio > 1.5:
+            score += 10
+            reasons.append("ITM Ratio {:.2f}x — strong put writing vs call writing (bullish)".format(itm_ratio))
+        elif itm_ratio < 0.67:
+            score -= 10
+            reasons.append("ITM Ratio {:.2f}x — call writing dominates (bearish)".format(itm_ratio))
+    elif total_pe_chg > 0 and total_ce_chg <= 0:
+        itm_ratio = 99.0
+        score += 10; reasons.append("PE writing with CE unwinding (strongly bullish)")
+    elif total_ce_chg > 0 and total_pe_chg <= 0:
+        itm_ratio = 0.0
+        score -= 10; reasons.append("CE writing with PE unwinding (strongly bearish)")
+    else:
+        itm_ratio = 0.0
+
+    # ── Max CE / PE OI strikes ────────────────────────────────────────────────
+    ce_total = df["ce_oi"].sum()
+    pe_total = df["pe_oi"].sum()
+    max_ce   = df.loc[df["ce_oi"].idxmax(), "strike"] if ce_total > 0 else underlying
+    max_pe   = df.loc[df["pe_oi"].idxmax(), "strike"] if pe_total > 0 else underlying
     if underlying < max_ce:
         reasons.append("Resistance at {} (max CE OI)".format(int(max_ce)))
     if underlying > max_pe:
         reasons.append("Support at {} (max PE OI)".format(int(max_pe)))
 
+    # ── Final signal ──────────────────────────────────────────────────────────
     if score > 20:
         sig, conf, col = "BUY CALL", min(90, 50 + score),      "green"
     elif score < -20:
@@ -203,9 +267,22 @@ def generate_signal(df, meta):
     else:
         sig, conf, col = "AVOID / WAIT", max(10, 50 - abs(score)), "orange"
 
+    strategy_type, strategy_note = _strategy_for_conviction(score, min(90, 50 + abs(score)))
+
     return {
-        "signal": sig, "confidence": conf, "score": score,
-        "pcr": pcr, "max_pain": max_pain,
-        "max_ce_resistance": max_ce, "max_pe_support": max_pe,
-        "reasons": reasons, "color": col,
+        "signal":            sig,
+        "confidence":        conf,
+        "score":             score,
+        "pcr":               pcr,
+        "max_pain":          max_pain,
+        "max_ce_resistance": max_ce,
+        "max_pe_support":    max_pe,
+        "reasons":           reasons,
+        "color":             col,
+        "call_sum":          call_sum,
+        "put_sum":           put_sum,
+        "oi_difference":     oi_diff,
+        "itm_ratio":         itm_ratio,
+        "strategy_type":     strategy_type,
+        "strategy_note":     strategy_note,
     }

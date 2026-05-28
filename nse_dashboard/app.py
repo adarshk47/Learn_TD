@@ -228,6 +228,23 @@ with tab_live:
     c3.metric("Max Pain",      "₹{:,.0f}".format(max_pain))
     c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
     c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+
+    # ── OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) ─
+    oi1, oi2, oi3, oi4, oi5 = st.columns(5)
+    call_sum_v = sig.get("call_sum", 0)
+    put_sum_v  = sig.get("put_sum", 0)
+    oi_diff_v  = sig.get("oi_difference", 0)
+    itm_r      = sig.get("itm_ratio", 0)
+    oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
+               delta="CE writing ↑" if call_sum_v > 0 else "CE covering ↓")
+    oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
+               delta="PE writing ↑" if put_sum_v > 0 else "PE covering ↓")
+    oi3.metric("OI Difference", "{:+.1f}K".format(oi_diff_v),
+               delta="Bearish" if oi_diff_v > 0 else "Bullish")
+    oi4.metric("ITM Ratio", "{:.2f}x".format(itm_r),
+               delta="Bullish" if itm_r > 1.5 else ("Bearish" if itm_r < 0.67 and itm_r > 0 else "Neutral"))
+    strat_type = sig.get("strategy_type", "WAIT")
+    oi5.metric("Suggested Strategy", strat_type)
     st.divider()
 
     sig_col, reason_col = st.columns([1, 2])
@@ -264,8 +281,8 @@ with tab_live:
         st.markdown("#### Analysis Breakdown")
         for r in sig["reasons"]:
             rl   = r.lower()
-            icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing"]) else \
-                   "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing"]) else "🟡"
+            icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
+                   "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "🟡"
             st.markdown(icon + " " + r)
         st.markdown("---")
         st.markdown("#### Key Levels")
@@ -273,6 +290,18 @@ with tab_live:
             "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
             "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
         }), hide_index=True, use_container_width=True)
+        st.markdown("---")
+        strat_note = sig.get("strategy_note", "")
+        if strat_note:
+            st.markdown("#### Strategy Recommendation")
+            strat_col = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
+                        "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;border-left:4px solid {};">'
+                '<b style="color:{};">{}</b><br><span style="color:#ccc;font-size:13px;">{}</span>'
+                '</div>'.format(strat_col, strat_col, strat_type, strat_note),
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
