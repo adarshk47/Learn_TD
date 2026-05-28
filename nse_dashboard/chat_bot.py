@@ -232,13 +232,191 @@ def _trade_decision(df: pd.DataFrame, meta: dict, sig: dict) -> str:
     return "\n".join(lines)
 
 
-# ── Scalping Checklist ────────────────────────────────────────────────────────
+# ── Timeframe configuration ───────────────────────────────────────────────────
 
-def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
+# Research-backed parameters per timeframe.
+# Sources: NSE option chain methodology (VarunS2002), Zerodha Varsity intraday
+# guide, and standard RSI/EMA practitioner thresholds for Indian indices.
+_TF_CONFIG = {
+    "5-min": {
+        "label":       "5-min Scalp",
+        "sl_pct":      0.20,   # tight stop — 20% of premium
+        "tgt_pct":     0.30,   # quick target — 30% of premium
+        "rr":          "1 : 1.5",
+        "max_hold":    "10–15 min",
+        "best_time":   "9:20–10:00 AM  |  2:15–3:00 PM",
+        "rsi_bull":    65,     # stronger momentum needed for very short-term
+        "rsi_bear":    35,
+        "vol_mult":    "2×+ average",
+        "chart_ema":   "9-EMA on 5-min",
+        "chart_extra": "VWAP — trade only in VWAP direction",
+        "manual_checks": [
+            "5-min candle closed strongly above/below VWAP",
+            "5-min RSI > 65 (calls) or < 35 (puts) — extreme reading required",
+            "Volume on signal candle > 2× the 5-bar average",
+            "No major level (round number, PDH/PDL) within 30 points",
+            "Time window: 9:20–10:00 AM or 2:15–3:00 PM only",
+            "Bid-ask spread at ATM < ₹3 (5-min scalps need very tight spreads)",
+        ],
+        "tips": [
+            "Only trade 5-min scalps during the first 45 min and last 45 min of the session",
+            "3-candle confirmation rule: wait for 3 consecutive candles above 9-EMA before entry",
+            "Exit at any sign of reversal — do not wait for target if price stalls",
+            "One bad trade can wipe 3 winning scalps — strict 20% SL is non-negotiable",
+        ],
+    },
+    "15-min": {
+        "label":       "15-min Intraday",
+        "sl_pct":      0.30,
+        "tgt_pct":     0.50,
+        "rr":          "1 : 1.7",
+        "max_hold":    "45–60 min",
+        "best_time":   "9:30–11:30 AM  |  1:30–3:00 PM",
+        "rsi_bull":    60,
+        "rsi_bear":    40,
+        "vol_mult":    "1.5× average",
+        "chart_ema":   "20-EMA on 15-min",
+        "chart_extra": "SuperTrend (10, 3) direction on 15-min",
+        "manual_checks": [
+            "15-min close above 20-EMA (calls) or below 20-EMA (puts)",
+            "RSI(14) on 15-min: > 60 bullish entry  |  < 40 bearish entry",
+            "SuperTrend(10,3) green (calls) or red (puts) on 15-min chart",
+            "Volume on signal candle > 1.5× the 5-bar average",
+            "No major event (RBI, earnings, FII data) in next 1 hour",
+            "1-hr chart in same direction (higher-timeframe alignment)",
+        ],
+        "tips": [
+            "Best entry: 15-min candle that re-tests 20-EMA after a breakout",
+            "Avoid trading between 12:00–1:30 PM (low volume, choppy)",
+            "If 1-hr trend opposes 15-min signal, skip — trade only with the big trend",
+            "CE/PE LTP should move ≥ ₹5 within 2 candles after entry, else exit early",
+        ],
+    },
+    "30-min": {
+        "label":       "30-min Swing",
+        "sl_pct":      0.35,
+        "tgt_pct":     0.60,
+        "rr":          "1 : 1.7",
+        "max_hold":    "1.5–2 hours",
+        "best_time":   "9:45 AM–12:00 PM  |  1:30–3:15 PM",
+        "rsi_bull":    58,
+        "rsi_bear":    42,
+        "vol_mult":    "1.3× average",
+        "chart_ema":   "20-EMA on 30-min",
+        "chart_extra": "Bollinger Band mid-line (20-period)",
+        "manual_checks": [
+            "30-min close above 20-EMA (calls) or below (puts)",
+            "RSI(14) on 30-min: 55–70 range for calls  |  30–45 for puts",
+            "OI chain: PCR direction aligned with signal",
+            "Max Pain within 0.5% of spot (neutral) OR clearly on your side",
+            "1-hr trend aligned (higher-timeframe confirmation)",
+            "Volume above 30-min average by at least 1.3×",
+        ],
+        "tips": [
+            "30-min trades balance between scalp speed and sufficient reward",
+            "Use option chain OI to confirm: put writers at support = calls OK",
+            "Watch for divergence between 15-min RSI and price (early reversal signal)",
+            "If holding into lunch (12–1:30 PM), consider partial exit — volume dries up",
+        ],
+    },
+    "1-hr": {
+        "label":       "1-hr Intraday",
+        "sl_pct":      0.40,
+        "tgt_pct":     0.65,
+        "rr":          "1 : 1.6",
+        "max_hold":    "2–3 hours",
+        "best_time":   "9:30–11:30 AM  |  1:30–3:00 PM",
+        "rsi_bull":    55,
+        "rsi_bear":    45,
+        "vol_mult":    "1.2× average",
+        "chart_ema":   "20-EMA on 1-hr  +  50-EMA trend",
+        "chart_extra": "MACD(12,26,9) signal crossover on 1-hr",
+        "manual_checks": [
+            "1-hr close above 20-EMA (calls) or below 20-EMA (puts)",
+            "1-hr RSI(14) > 55 for calls  |  < 45 for puts",
+            "MACD histogram positive (calls) or negative (puts) on 1-hr",
+            "Option chain: PCR > 1.1 for calls  |  < 0.9 for puts",
+            "Max Pain above spot (calls) or below spot (puts)",
+            "ATM OI change: PE writing at support (calls) | CE writing at resistance (puts)",
+            "No major economic data release in next 2 hours",
+        ],
+        "tips": [
+            "1-hr is the most reliable intraday timeframe — skip 5-min noise",
+            "Always confirm with the option chain: if OI doesn't agree, wait",
+            "Entry at 9:30 AM after the 9:15–9:25 gap fills is often the best",
+            "Book 50% at Target 1 (+40%), trail remainder with 20-EMA as guide",
+        ],
+    },
+    "2-hr": {
+        "label":       "2-hr Positional",
+        "sl_pct":      0.45,
+        "tgt_pct":     0.80,
+        "rr":          "1 : 1.8",
+        "max_hold":    "1 trading day",
+        "best_time":   "Morning session (before 12:00 PM)",
+        "rsi_bull":    55,
+        "rsi_bear":    45,
+        "vol_mult":    "1.1× average",
+        "chart_ema":   "50-EMA on 1-hr  +  20-EMA on daily",
+        "chart_extra": "Daily Supertrend direction",
+        "manual_checks": [
+            "Daily candle above 20-EMA — medium-term trend is up (calls)",
+            "1-hr RSI(14) > 55 and not overbought (< 70) for call entry",
+            "SuperTrend on daily chart: green for calls, red for puts",
+            "Option chain PCR strongly bullish (> 1.2) or bearish (< 0.8)",
+            "Max Pain pull clearly directional (> 0.5% away from spot)",
+            "FII/DII data (NSE website) — net buyers align with your direction",
+            "VIX: below 16 = calm market, better for directional trades",
+        ],
+        "tips": [
+            "2-hr positional trades carry overnight/session risk — use defined risk spreads",
+            "Consider Bull Put Spread (calls) or Bear Call Spread (puts) instead of naked options",
+            "Check SGX Nifty or Dow futures for macro alignment",
+            "Exit before the last 30 min if target not hit — theta decay accelerates",
+        ],
+    },
+    "daily": {
+        "label":       "Daily Swing",
+        "sl_pct":      0.50,
+        "tgt_pct":     1.00,
+        "rr":          "1 : 2.0",
+        "max_hold":    "2–3 trading days",
+        "best_time":   "Any — use daily close data",
+        "rsi_bull":    55,
+        "rsi_bear":    45,
+        "vol_mult":    "Above 5-day average",
+        "chart_ema":   "20-EMA on daily  +  50-EMA direction",
+        "chart_extra": "Weekly chart trend alignment",
+        "manual_checks": [
+            "Daily close above 20-EMA AND 50-EMA (calls) or below both (puts)",
+            "Daily RSI(14) > 55 and trending up (calls) | < 45 trending down (puts)",
+            "Weekly chart in same direction — don't fight the weekly trend",
+            "FII net buying (calls) or selling (puts) consistently this week",
+            "VIX < 20 for buying calls/puts; very high VIX = prefer selling strategies",
+            "Check Max Pain for next expiry — build into the expiry pull",
+            "Option chain: large OI buildup at nearby support / resistance",
+            "No major event (Union Budget, RBI, US Fed) in next 2–3 days",
+        ],
+        "tips": [
+            "For daily swing, use next-week expiry or monthly expiry options (more time)",
+            "Prefer Bull Put Spread / Bear Call Spread for defined risk swing trades",
+            "Historical win rate: Credit Spreads 79%, Naked Options 58% on swing timeframe",
+            "Close before any high-impact news event — tail risk kills swing P&L",
+            "Trail stop-loss using 20-EMA on daily chart once in profit by 30%+",
+        ],
+    },
+}
+
+
+# ── Scalping / Intraday Checklist ─────────────────────────────────────────────
+
+def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict,
+                        timeframe: str = "1-hr") -> str:
     """
-    Dynamic pass/fail checklist for intraday 1-hour scalping trades.
-    Checks what can be derived from option chain data; flags manual checks.
+    Dynamic pass/fail checklist for intraday/positional option trades.
+    Timeframe-aware: adjusts SL, target, manual checks per timeframe.
     """
+    tf  = _TF_CONFIG.get(timeframe, _TF_CONFIG["1-hr"])
     underlying = _safe_float(meta.get("underlying", 0))
     atm        = _safe_float(meta.get("atm", underlying))
     pcr        = _safe_float(sig.get("pcr", 0))
@@ -266,9 +444,8 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
         atm_oi_bias = "N/A"
         atm_oi_ok   = "⚠️"
 
-    # ATM liquidity (OI > 50k is decent)
-    atm_ce_oi = 0.0
-    atm_pe_oi = 0.0
+    # ATM liquidity
+    atm_ce_oi = atm_pe_oi = 0.0
     if not df.empty:
         try:
             idx = (df["strike"] - underlying).abs().idxmin()
@@ -276,7 +453,7 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
             atm_pe_oi = _safe_float(df.iloc[idx].get("pe_oi", 0))
         except Exception:
             pass
-    liq_oi = atm_ce_oi if signal == "BUY CALL" else atm_pe_oi
+    liq_oi  = atm_ce_oi if signal == "BUY CALL" else atm_pe_oi
     chk_liq = "✅" if liq_oi > 50000 else "⚠️" if liq_oi > 10000 else "❌"
     liq_note = "{:,.0f} lots at ATM".format(liq_oi)
 
@@ -284,7 +461,11 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
     room_to_sup = (underlying - pe_sup) / max(underlying, 1) * 100
     pain_diff   = max_pain - underlying
 
-    chk_sig  = "✅" if confidence >= 65 else "⚠️" if confidence >= 50 else "❌"
+    # Confidence threshold is tighter for shorter timeframes
+    conf_thresh = 70 if timeframe in ("5-min", "15-min") else 65
+    chk_sig  = "✅" if confidence >= conf_thresh else "⚠️" if confidence >= 50 else "❌"
+
+    # PCR check
     chk_pcr  = "✅" if (signal == "BUY CALL" and pcr > 1.1) or \
                        (signal == "BUY PUT"  and pcr < 0.9) else \
                "⚠️" if 0.9 <= pcr <= 1.1 else "❌"
@@ -306,7 +487,7 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
     else:
         verdict = "🔴 **WAIT** — only {}/{} pass, skip this setup".format(passed, total)
 
-    # Preferred instrument for scalp
+    # Trade instrument
     if signal == "BUY CALL":
         instr = "ATM CE → ₹{} CE  (LTP ≈ ₹{:.1f})".format(int(atm), ce_ltp) if ce_ltp > 0 else "ATM CE"
     elif signal == "BUY PUT":
@@ -315,19 +496,20 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
         instr = "No directional trade — WAIT"
 
     ref_ltp = (ce_ltp if signal == "BUY CALL" else pe_ltp) if signal != "AVOID / WAIT" else 0
-    sl_ltp  = round(ref_ltp * 0.60, 1) if ref_ltp > 0 else 0
-    tgt_ltp = round(ref_ltp * 1.55, 1) if ref_ltp > 0 else 0
+    sl_ltp  = round(ref_ltp * (1 - tf["sl_pct"]),  1) if ref_ltp > 0 else 0
+    tgt_ltp = round(ref_ltp * (1 + tf["tgt_pct"]), 1) if ref_ltp > 0 else 0
 
     lines = [
-        "## 📋 Scalping Checklist — {} (1-Hour Intraday)".format(symbol),
+        "## 📋 {} Checklist — {}".format(tf["label"], symbol),
         "",
         verdict,
         "",
         "---",
-        "### Auto Checks (from live data)",
+        "### Auto Checks (from live option chain data)",
         "",
         "**Direction & Signal**",
-        "{} Signal: **{}** · Confidence {}%".format(chk_sig, signal, int(confidence)),
+        "{} Signal: **{}** · Confidence {}% (need ≥{}%)".format(
+            chk_sig, signal, int(confidence), conf_thresh),
         "{} PCR: **{}** → {}".format(
             chk_pcr, _fmt(pcr),
             "Bullish" if pcr > 1.1 else "Bearish" if pcr < 0.9 else "Neutral"
@@ -343,7 +525,7 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
         "{} IV: **{:.1f}%** — {}".format(
             chk_iv, avg_iv,
             "cheap, good to buy" if avg_iv < 14 else
-            "fair value" if avg_iv < 22 else "expensive, prefer selling"
+            "fair value" if avg_iv < 22 else "expensive, prefer selling strategy"
         ),
         "{} Liquidity: **{}**".format(chk_liq, liq_note),
         "",
@@ -352,45 +534,50 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
         "{} Support: ₹{} PE floor — **{:.1f}% below**".format(chk_sup, int(pe_sup), room_to_sup),
         "",
         "---",
-        "### Manual Checks (do these on your chart)",
+        "### Manual Checks (verify on your chart)",
         "",
-        "⬜ **15-min chart:** Close above 20-EMA? (calls) / Below? (puts)",
-        "⬜ **15-min RSI:** > 55 for calls · < 45 for puts",
-        "⬜ **Volume:** Current candle volume > 3-bar average?",
-        "⬜ **1-hr trend:** Higher highs & higher lows (calls) / Lower lows (puts)?",
-        "⬜ **No events:** Any RBI, GDP, earnings, or major news next 2 hours?",
-        "⬜ **Time window:** Are you in 9:20–10:30 AM or 1:30–3:00 PM IST?",
+    ]
+    for chk in tf["manual_checks"]:
+        lines.append("⬜ " + chk)
+
+    lines += [
         "",
         "---",
-        "### Trade Parameters",
+        "### Trade Parameters — {}".format(tf["label"]),
         "",
         "| | |",
         "|---|---|",
         "| Instrument | {} |".format(instr),
-        "| Stop-loss | ₹{:.1f} (−40% of premium) |".format(sl_ltp) if sl_ltp > 0 else "| Stop-loss | 40% of your entry premium |",
-        "| Target | ₹{:.1f} (+55%) |".format(tgt_ltp) if tgt_ltp > 0 else "| Target | 55% gain on premium |",
-        "| Max hold | 1 hour / 3:15 PM |",
+        "| Stop-loss | ₹{:.1f} (−{}% of premium) |".format(sl_ltp, int(tf["sl_pct"]*100))
+            if sl_ltp > 0 else "| Stop-loss | {}% of your entry premium |".format(int(tf["sl_pct"]*100)),
+        "| Target | ₹{:.1f} (+{}%) |".format(tgt_ltp, int(tf["tgt_pct"]*100))
+            if tgt_ltp > 0 else "| Target | {}% gain on premium |".format(int(tf["tgt_pct"]*100)),
+        "| R:R | {} |".format(tf["rr"]),
+        "| Max hold | {} |".format(tf["max_hold"]),
+        "| Best entry window | {} |".format(tf["best_time"]),
+        "| Chart EMA | {} |".format(tf["chart_ema"]),
+        "| Extra indicator | {} |".format(tf["chart_extra"]),
         "| Lot rule | 1 lot per ₹50,000 capital |",
-        "| R:R | 1 : 1.4 (40% SL, 55% target) |",
+        "| Volume needed | {} |".format(tf["vol_mult"]),
         "",
         "---",
-        "### What to check for scalping (theory)",
+        "### Key Tips — {}".format(tf["label"]),
         "",
-        "**Price action:**",
-        "• Breakout of previous 15-min high (for calls) or low (for puts)",
-        "• Strong close candle — not a doji or inside bar",
+    ]
+    for tip in tf["tips"]:
+        lines.append("• " + tip)
+
+    lines += [
         "",
-        "**Options-specific:**",
-        "• Prefer ATM strikes — tightest spreads, best delta",
-        "• Avoid 30+ mins before expiry — gamma explosion risk",
-        "• Watch bid-ask spread: > ₹5 gap at ATM = avoid (low liquidity)",
-        "• Rising OI + rising LTP = fresh buildup (strong signal)",
-        "• Falling OI + rising LTP = short covering (weaker signal)",
+        "---",
+        "### General Options Scalping Rules (all timeframes)",
         "",
-        "**Risk management:**",
-        "• Never risk > 2% of capital on one scalp",
-        "• Exit at SL without hesitation — no averaging down in options",
-        "• Bank partial profit at Target 1, trail the rest",
+        "• Prefer ATM strikes — tightest spreads, best delta (0.5)",
+        "• Avoid last 30 min before weekly expiry — gamma explosion risk",
+        "• Rising OI + rising LTP = fresh long buildup (strong signal)",
+        "• Falling OI + rising LTP = short covering (weaker, may reverse)",
+        "• Never average down on a losing options position",
+        "• Exit at SL without hesitation — 1 loss = 2 wins wiped at 40% SL",
         "",
         "⚠️ Educational only — not financial advice.",
     ]
@@ -399,7 +586,8 @@ def _scalping_checklist(df: pd.DataFrame, meta: dict, sig: dict) -> str:
 
 # ── Keyword-based answers ─────────────────────────────────────────────────────
 
-def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
+def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict,
+                    timeframe: str = "1-hr") -> str:
     q = query.lower().strip()
 
     underlying = _safe_float(meta.get("underlying", 0))
@@ -424,10 +612,27 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
 
     # ── Scalping / intraday checklist ─────────────────────────────────────────
     if any(w in q for w in [
-        "scalp", "scalping", "intraday", "1 hour", "one hour", "checklist",
+        "scalp", "scalping", "intraday", "checklist",
         "what to check", "before trade", "pre trade", "pre-trade",
+        "5 min", "5min", "15 min", "15min", "30 min", "30min",
+        "1 hour", "one hour", "2 hour", "two hour", "daily swing",
     ]):
-        return _scalping_checklist(df, meta, sig)
+        # Detect requested timeframe from query
+        # Detect requested timeframe from query; fallback to caller-supplied default
+        tf = timeframe
+        if any(w in q for w in ["5 min", "5min", "5-min"]):
+            tf = "5-min"
+        elif any(w in q for w in ["15 min", "15min", "15-min"]):
+            tf = "15-min"
+        elif any(w in q for w in ["30 min", "30min", "30-min"]):
+            tf = "30-min"
+        elif any(w in q for w in ["2 hour", "two hour", "2hr", "2-hr"]):
+            tf = "2-hr"
+        elif any(w in q for w in ["daily", "swing", "positional"]):
+            tf = "daily"
+        elif any(w in q for w in ["1 hour", "one hour", "1hr", "1-hr"]):
+            tf = "1-hr"
+        return _scalping_checklist(df, meta, sig, timeframe=tf)
 
     # ── Signal / trade ────────────────────────────────────────────────────────
     if any(w in q for w in ["signal", "buy", "sell", "trade", "recommend"]):
@@ -628,8 +833,10 @@ def _keyword_answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
             "Ask me about any of these:\n\n"
             "🎯 **trade decision** / should I buy / entry\n"
             "   → Full BUY/AVOID recommendation with entry, SL, target\n\n"
-            "📋 **scalping** / intraday / checklist\n"
-            "   → Dynamic pass/fail checklist for 1-hour intraday trades\n\n"
+            "📋 **checklist** / intraday / scalping + timeframe\n"
+            "   → **5-min checklist** · **15-min checklist** · **30-min checklist**\n"
+            "   → **1-hour checklist** (default) · **2-hour checklist** · **daily checklist**\n"
+            "   → Each has timeframe-specific RSI levels, SL%, hold time, tips\n\n"
             "📊 **signal** / trade / buy / sell\n"
             "   → Current signal with reasons\n\n"
             "📉 **pcr** / put call ratio\n"
@@ -765,10 +972,12 @@ def _claude_answer(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
+def answer(query: str, df: pd.DataFrame, meta: dict, sig: dict,
+           timeframe: str = "1-hr") -> str:
     """
     Main entry point. Tries Claude API first if anthropic_api_key is in
     st.secrets, otherwise uses keyword-based matching.
+    timeframe: one of "5-min", "15-min", "30-min", "1-hr", "2-hr", "daily"
     """
     if not query or not query.strip():
         return "Please ask a question. Type **help** for topics, or ask for a **trade decision**."
@@ -787,4 +996,4 @@ def answer(query: str, df: pd.DataFrame, meta: dict, sig: dict) -> str:
     if api_key:
         return _claude_answer(query, df, meta, sig, api_key)
 
-    return _keyword_answer(query, df, meta, sig)
+    return _keyword_answer(query, df, meta, sig, timeframe=timeframe)

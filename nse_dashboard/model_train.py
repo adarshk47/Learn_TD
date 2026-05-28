@@ -1,15 +1,18 @@
 """
-Model training / weight calibration for NSE Options Intelligence dashboard.
+Model weight calibration for NSE Options Intelligence dashboard.
 
-Grid-searches over the same 5 weights used by backtest._make_signal() so that
+Uses RSI-14 + EMA-9/21 + volume consensus strategy.
+Grid-searches over the same params used by backtest._make_signal() so that
 "Apply These Weights" actually changes the win rate shown in the backtest.
 
 Weight schema (must match backtest._make_signal):
-    sma_score        — score added when close > SMA5
-    trend_score      — score added when SMA5 > SMA10
-    mom_score        — score added when daily % change exceeds mom_threshold
-    signal_threshold — minimum |score| to issue a BUY CALL / BUY PUT signal
-    mom_threshold    — % change magnitude that triggers momentum score
+    rsi_bull      — RSI-14 threshold above which momentum is bullish
+    rsi_bear      — RSI-14 threshold below which momentum is bearish
+    vol_threshold — volume ratio (current / 5-day avg) needed for confirmation
+    min_agree     — how many of 3 indicators must agree (2=balanced, 3=strict)
+
+Note: Win rate on synthetic/random-walk data will always be near 50%.
+Use Angel One (Live) data source for meaningful calibration results.
 """
 
 from __future__ import annotations
@@ -21,88 +24,69 @@ from typing import Any
 
 import pandas as pd
 
-# ── File path (shared with backtest.py) ───────────────────────────────────────
-
 _MODEL_WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), ".model_weights.json")
 
-# ── Defaults (must match backtest.load_weights defaults) ─────────────────────
-
 _DEFAULTS: dict[str, Any] = {
-    "sma_score":        15,
-    "trend_score":      10,
-    "mom_score":        10,
-    "signal_threshold": 15,
-    "mom_threshold":    0.3,
+    "rsi_bull":      65,
+    "rsi_bear":      35,
+    "vol_threshold": 1.3,
+    "min_agree":     3,
 }
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
-
 def calibrate_weights(candles_df: pd.DataFrame) -> dict:
     """
-    Grid-search to find the best combination of signal scoring weights.
+    Grid-search to find the best RSI/volume params for signal accuracy.
 
-    Evaluates each combination using backtest.run_accuracy_backtest() — the
-    exact same function used to display win rate — so applying the best params
-    will actually change the win rate.
+    Search space (3 × 3 × 3 × 2 = 54 combinations):
+        rsi_bull      : [55, 60, 65]
+        rsi_bear      : [35, 40, 45]
+        vol_threshold : [1.1, 1.3, 1.5]
+        min_agree     : [2, 3]
 
-    Search space (4 × 4 × 4 × 3 × 3 = 576 combinations):
-        sma_score        : [10, 15, 20, 25]
-        trend_score      : [5, 8, 10, 12]
-        mom_score        : [5, 8, 10, 12]
-        signal_threshold : [10, 12, 15]
-        mom_threshold    : [0.2, 0.3, 0.5]
-
-    Returns
-    -------
-    dict with keys:
-        best_params    dict          — weights that maximised win rate
-        accuracy_grid  pd.DataFrame  — full grid sorted by accuracy descending
-        best_accuracy  float         — best win rate percentage
+    Returns dict with keys: best_params, accuracy_grid, best_accuracy
     """
     from backtest import run_accuracy_backtest
 
-    if candles_df is None or candles_df.empty or len(candles_df) < 12:
+    if candles_df is None or candles_df.empty or len(candles_df) < 15:
         return {
             "best_params":   _DEFAULTS.copy(),
             "accuracy_grid": pd.DataFrame(),
             "best_accuracy": 0.0,
         }
 
-    sma_scores        = [10, 15, 20, 25]
-    trend_scores      = [5, 8, 10, 12]
-    mom_scores        = [5, 8, 10, 12]
-    signal_thresholds = [10, 12, 15]
-    mom_thresholds    = [0.2, 0.3, 0.5]
+    rsi_bulls      = [55, 60, 65]
+    rsi_bears      = [35, 40, 45]
+    vol_thresholds = [1.1, 1.3, 1.5]
+    min_agrees     = [2, 3]
 
     grid_rows   = []
     best_acc    = -1.0
     best_params = _DEFAULTS.copy()
 
-    for sma_s, trend_s, mom_s, sig_thresh, mom_thresh in product(
-        sma_scores, trend_scores, mom_scores, signal_thresholds, mom_thresholds
+    for rsi_bull, rsi_bear, vol_thresh, min_agree in product(
+        rsi_bulls, rsi_bears, vol_thresholds, min_agrees
     ):
         test_weights = {
-            "sma_score":        sma_s,
-            "trend_score":      trend_s,
-            "mom_score":        mom_s,
-            "signal_threshold": sig_thresh,
-            "mom_threshold":    mom_thresh,
+            "rsi_bull":      rsi_bull,
+            "rsi_bear":      rsi_bear,
+            "vol_threshold": vol_thresh,
+            "min_agree":     min_agree,
         }
 
         metrics, _ = run_accuracy_backtest(candles_df, params=test_weights)
-        accuracy = metrics.get("win_rate", 0.0) if metrics else 0.0
+        accuracy      = metrics.get("win_rate", 0.0)   if metrics else 0.0
+        total_traded  = metrics.get("total_traded", 0) if metrics else 0
+        signal_rate   = metrics.get("signal_rate", 0)  if metrics else 0.0
 
-        # Only record combos that actually generated trades
-        total_traded = metrics.get("total_traded", 0) if metrics else 0
         grid_rows.append({
-            "sma_score":        sma_s,
-            "trend_score":      trend_s,
-            "mom_score":        mom_s,
-            "signal_threshold": sig_thresh,
-            "mom_threshold":    mom_thresh,
-            "trades":           total_traded,
-            "accuracy":         accuracy,
+            "rsi_bull":      rsi_bull,
+            "rsi_bear":      rsi_bear,
+            "vol_threshold": vol_thresh,
+            "min_agree":     min_agree,
+            "trades":        total_traded,
+            "signal_rate":   signal_rate,
+            "accuracy":      accuracy,
         })
 
         if accuracy > best_acc and total_traded >= 3:
@@ -123,7 +107,6 @@ def calibrate_weights(candles_df: pd.DataFrame) -> dict:
 
 
 def apply_weights(weights: dict) -> None:
-    """Persist calibrated weights to .model_weights.json."""
     try:
         with open(_MODEL_WEIGHTS_FILE, "w") as f:
             json.dump(weights, f, indent=2)
@@ -132,42 +115,25 @@ def apply_weights(weights: dict) -> None:
 
 
 def load_weights() -> dict:
-    """Load saved weights; falls back to defaults for any missing keys."""
     from backtest import load_weights as bt_load
     return bt_load()
 
 
 def get_feature_importance(results_df: pd.DataFrame) -> dict:
-    """
-    Estimate which indicators contribute most to correct signals via
-    Pearson correlation between each feature proxy and directional accuracy.
-    """
     import math
     import numpy as np
 
-    empty = {
-        "momentum":    0.0,
-        "score":       0.0,
-        "consistency": 0.0,
-        "pcr_proxy":   0.0,
-        "pain_proxy":  0.0,
-    }
+    empty = {"rsi": 0.0, "ema_trend": 0.0, "volume": 0.0}
 
     if results_df is None or results_df.empty:
         return empty
-
-    df = results_df.copy()
-    if not {"pct_chg", "correct"}.issubset(df.columns):
+    if not {"pct_chg", "correct"}.issubset(results_df.columns):
         return empty
 
-    traded = (
-        df[df["signal"].isin(["BUY CALL", "BUY PUT"])]
-        if "signal" in df.columns else df
-    )
+    df     = results_df.copy()
+    traded = df[df["signal"].isin(["BUY CALL", "BUY PUT"])] if "signal" in df.columns else df
     if len(traded) < 3:
         traded = df
-
-    result = {}
 
     def _corr(a, b):
         try:
@@ -176,14 +142,9 @@ def get_feature_importance(results_df: pd.DataFrame) -> dict:
         except Exception:
             return 0.0
 
-    result["momentum"]    = _corr(traded["pct_chg"], traded["correct"])
-    result["score"]       = _corr(traded.get("score", pd.Series(0, index=traded.index)), traded["correct"])
-    try:
-        cons = pd.Series(np.sign(traded["pct_chg"].values)).rolling(3).mean().fillna(0.0)
-        result["consistency"] = _corr(cons, traded["correct"].reset_index(drop=True))
-    except Exception:
-        result["consistency"] = 0.0
-    result["pcr_proxy"]   = _corr((traded["pct_chg"] > 0).astype(float), traded["correct"])
-    result["pain_proxy"]  = _corr(traded["pct_chg"].abs(), traded["correct"])
-
+    result = {
+        "rsi":       _corr(traded.get("rsi14", pd.Series(50, index=traded.index)), traded["correct"]),
+        "ema_trend": _corr(traded["pct_chg"], traded["correct"]),
+        "volume":    _corr(traded["pct_chg"].abs(), traded["correct"]),
+    }
     return result

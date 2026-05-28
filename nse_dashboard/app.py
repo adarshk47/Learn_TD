@@ -15,7 +15,7 @@ import chat_bot
 import backtest
 import model_train
 
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 
 st.set_page_config(
     page_title="NSE Options Intelligence {}".format(APP_VERSION),
@@ -499,8 +499,11 @@ with tab_bt:
         if bt_mode.startswith("A"):
             st.markdown("### Signal Accuracy Backtest")
             st.markdown(
-                "Simulates SMA-crossover + momentum signals on {} daily candles "
-                "and checks if next-day direction was correct.".format(bt_days)
+                "Uses **RSI-14 + EMA-9/EMA-21 crossover + volume ratio** consensus "
+                "on {} daily candles. Signals fire only when 2+ indicators agree — "
+                "higher selectivity means fewer trades but better quality signals. "
+                "**Note:** Synthetic demo data is a random walk; near-50% win rate "
+                "on synthetic data is expected. Use Angel One for real results.".format(bt_days)
             )
             if st.button("Run Accuracy Backtest", type="primary", key="run_acc"):
                 with st.spinner("Running backtest…"):
@@ -508,11 +511,13 @@ with tab_bt:
                 if not metrics:
                     st.error("Not enough data (need ≥12 candles).")
                 else:
-                    m1, m2, m3, m4 = st.columns(4)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Win Rate",      "{}%".format(metrics["win_rate"]))
                     m2.metric("Call Accuracy", "{}%".format(metrics["call_accuracy"]))
                     m3.metric("Put Accuracy",  "{}%".format(metrics["put_accuracy"]))
                     m4.metric("Total Traded",  str(metrics["total_traded"]))
+                    m5.metric("Signal Rate",   "{}%".format(metrics.get("signal_rate", 0)),
+                               delta="of candles had signal")
 
                     fig_eq = go.Figure()
                     fig_eq.add_trace(go.Scatter(
@@ -646,11 +651,12 @@ with tab_bt:
         else:
             st.markdown("### Model Weight Calibration")
             st.markdown(
-                "Grid-search over scoring parameters to find weights that maximise "
-                "signal accuracy on historical candles."
+                "Grid-searches over RSI thresholds, volume confirmation, and minimum "
+                "indicator agreement (54 combinations) to find params that maximise "
+                "signal accuracy. Works best with **Angel One** live candle data."
             )
 
-            if st.button("Run Grid Search (576 combinations)", type="primary", key="run_calib"):
+            if st.button("Run Grid Search (54 combinations)", type="primary", key="run_calib"):
                 with st.spinner("Calibrating — scanning 576 parameter combinations…"):
                     st.session_state["_calib"] = model_train.calibrate_weights(candles)
 
@@ -887,6 +893,36 @@ with tab_chat:
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    # ── Timeframe selector ────────────────────────────────────────────────────
+    st.markdown("#### Select Timeframe")
+    tf_options = {
+        "5-min":  "5-min Scalp",
+        "15-min": "15-min Intraday",
+        "30-min": "30-min Swing",
+        "1-hr":   "1-hr Intraday",
+        "2-hr":   "2-hr Positional",
+        "daily":  "Daily Swing",
+    }
+    selected_tf = st.radio(
+        "Timeframe",
+        list(tf_options.keys()),
+        format_func=lambda k: tf_options[k],
+        index=3,  # default 1-hr
+        horizontal=True,
+        key="chat_tf",
+        label_visibility="collapsed",
+    )
+
+    tf_info = {
+        "5-min":  "10-15 min hold · SL 20% · Target 30% · Best: 9:20-10:00 AM",
+        "15-min": "45-60 min hold · SL 30% · Target 50% · Best: 9:30-11:30 AM",
+        "30-min": "1.5-2 hr hold  · SL 35% · Target 60% · Best: 9:45 AM-12:00 PM",
+        "1-hr":   "2-3 hr hold    · SL 40% · Target 65% · Best: 9:30-11:30 AM",
+        "2-hr":   "1-day hold     · SL 45% · Target 80% · Use credit spreads",
+        "daily":  "2-3 day hold   · SL 50% · Target 100% · Use next-week expiry",
+    }
+    st.caption("⏱ " + tf_info[selected_tf])
+
     # ── Primary action buttons ────────────────────────────────────────────────
     st.markdown("#### Start here:")
     pa1, pa2 = st.columns(2)
@@ -899,20 +935,21 @@ with tab_chat:
     ):
         q = "trade decision"
         st.session_state.chat_history.append({"role": "user", "content": q})
-        a = chat_bot.answer(q, df, meta, sig)
+        a = chat_bot.answer(q, df, meta, sig, timeframe=selected_tf)
         st.session_state.chat_history.append({"role": "assistant", "content": a})
         st.rerun()
 
+    checklist_label = "📋 {} Checklist".format(tf_options[selected_tf])
     if pa2.button(
-        "📋 Scalping Checklist (1-hr)",
+        checklist_label,
         use_container_width=True,
         type="secondary",
         key="pa_scalp",
-        help="Dynamic pass/fail checklist for intraday 1-hour scalp trades",
+        help="Dynamic pass/fail checklist for {}".format(tf_options[selected_tf]),
     ):
-        q = "scalping checklist"
+        q = "checklist"
         st.session_state.chat_history.append({"role": "user", "content": q})
-        a = chat_bot.answer(q, df, meta, sig)
+        a = chat_bot.answer(q, df, meta, sig, timeframe=selected_tf)
         st.session_state.chat_history.append({"role": "assistant", "content": a})
         st.rerun()
 
@@ -924,7 +961,7 @@ with tab_chat:
             st.markdown(msg["content"])
 
     user_input = st.chat_input(
-        "Ask: trade decision · scalping checklist · signal · pcr · IV · tomorrow · help"
+        "Ask: trade decision · checklist · signal · pcr · IV · tomorrow · help"
     )
     if user_input:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
@@ -932,7 +969,8 @@ with tab_chat:
             st.markdown(user_input)
         with st.chat_message("assistant"):
             with st.spinner("Thinking…"):
-                answer = chat_bot.answer(user_input, df, meta, sig)
+                answer = chat_bot.answer(user_input, df, meta, sig,
+                                         timeframe=selected_tf)
             st.markdown(answer)
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
@@ -950,7 +988,7 @@ with tab_chat:
     for i, (label, question) in enumerate(quick_qs):
         if q_cols[i].button(label, use_container_width=True, key="qq_{}".format(i)):
             st.session_state.chat_history.append({"role": "user", "content": question})
-            answer = chat_bot.answer(question, df, meta, sig)
+            answer = chat_bot.answer(question, df, meta, sig, timeframe=selected_tf)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             st.rerun()
 
