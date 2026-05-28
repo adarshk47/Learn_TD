@@ -5,8 +5,10 @@ import random
 
 
 def generate_demo_option_chain(symbol="NIFTY"):
-    random.seed(42)
-    np.random.seed(42)
+    # Seed changes every minute so demo data refreshes on auto-refresh
+    seed = int(datetime.now().strftime("%Y%m%d%H%M"))
+    random.seed(seed)
+    np.random.seed(seed % (2**31))
 
     base_prices = {"NIFTY": 24350, "BANKNIFTY": 52400, "FINNIFTY": 23800, "MIDCPNIFTY": 12200}
     strike_gaps = {"NIFTY": 50,    "BANKNIFTY": 100,   "FINNIFTY": 50,    "MIDCPNIFTY": 25}

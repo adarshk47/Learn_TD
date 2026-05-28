@@ -15,8 +15,10 @@ import chat_bot
 import backtest
 import model_train
 
+APP_VERSION = "v2.1"
+
 st.set_page_config(
-    page_title="NSE Options Intelligence",
+    page_title="NSE Options Intelligence {}".format(APP_VERSION),
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -82,7 +84,7 @@ with st.sidebar:
     with col_t:
         test_mode = st.button("Test NSE", use_container_width=True)
 
-    st.caption("Updated: " + datetime.now().strftime("%H:%M:%S"))
+    st.caption("Updated: {}  |  {}".format(datetime.now().strftime("%H:%M:%S"), APP_VERSION))
 
 # ── Test NSE connection ───────────────────────────────────────────────────────
 if test_mode:
