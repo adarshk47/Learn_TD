@@ -8,3 +8,4 @@ pyotp>=2.9.0
 scipy>=1.11.0
 websocket-client>=1.6.0
 logzero>=1.7.0
+anthropic>=0.25.0

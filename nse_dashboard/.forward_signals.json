@@ -1,0 +1,13 @@
+[
+  {
+    "date": "2026-05-28",
+    "symbol": "NIFTY",
+    "signal": "BUY CALL",
+    "confidence": 90,
+    "underlying": 23907.15,
+    "pcr": 1.47,
+    "max_pain": 24000.0,
+    "outcome": "PENDING",
+    "next_close": null
+  }
+]

@@ -180,6 +180,16 @@ def _get_session():
 
 # ── Main public function ──────────────────────────────────────────────────────
 
+def fetch_historical_candles(symbol, is_index=True, days=30):
+    """Wrapper: get historical daily OHLCV using our Angel One session."""
+    try:
+        smart = _get_session()
+    except Exception:
+        return None
+    from backtest import get_historical_candles
+    return get_historical_candles(smart, symbol, is_index, days)
+
+
 def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20):
     """
     Returns (df, meta) with same schema as nse_data.parse_option_chain.
@@ -216,10 +226,11 @@ def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20):
     try:
         if is_index:
             idx_exchange_map = {
-                "NIFTY": ("NSE", "99926000"),
-                "BANKNIFTY": ("NSE", "99926009"),
-                "FINNIFTY": ("NSE", "99926037"),
+                "NIFTY":      ("NSE", "99926000"),
+                "BANKNIFTY":  ("NSE", "99926009"),
+                "FINNIFTY":   ("NSE", "99926037"),
                 "MIDCPNIFTY": ("NSE", "99926074"),
+                "SENSEX":     ("BSE", "1"),
             }
             exch, spot_token = idx_exchange_map.get(symbol.upper(), ("NSE", "99926000"))
             ltp_data = smart.ltpData(exch, symbol, spot_token)

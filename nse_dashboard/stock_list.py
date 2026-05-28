@@ -131,6 +131,16 @@ INDICES = {
     "BANKNIFTY":  "Nifty Bank",
     "FINNIFTY":   "Nifty Financial Services",
     "MIDCPNIFTY": "Nifty Midcap Select",
+    "SENSEX":     "BSE Sensex",
+}
+
+# Angel One exchange + token for spot LTP and historical candles
+INDEX_ANGEL_TOKENS = {
+    "NIFTY":      ("NSE", "99926000"),
+    "BANKNIFTY":  ("NSE", "99926009"),
+    "FINNIFTY":   ("NSE", "99926037"),
+    "MIDCPNIFTY": ("NSE", "99926074"),
+    "SENSEX":     ("BSE", "1"),
 }
 
 # yfinance symbols for indices (for spot price only)

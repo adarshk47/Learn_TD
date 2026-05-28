@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "symbol": "NIFTY",
+    "type": "BUY CALL",
+    "strike": 24000.0,
+    "expiry": "04-JUN-2026",
+    "lots": 2,
+    "lot_size": 75,
+    "entry_price": 140.0,
+    "entry_time": "2026-05-28 06:56:15",
+    "status": "CLOSED",
+    "exit_price": 180.0,
+    "exit_time": "2026-05-28 07:14:12",
+    "pnl": 6000.0
+  }
+]
