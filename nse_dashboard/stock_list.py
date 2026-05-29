@@ -127,12 +127,43 @@ NSE_STOCKS = {
 }
 
 INDICES = {
-    "NIFTY":      "Nifty 50",
-    "BANKNIFTY":  "Nifty Bank",
-    "FINNIFTY":   "Nifty Financial Services",
-    "MIDCPNIFTY": "Nifty Midcap Select",
-    "SENSEX":     "BSE Sensex",
+    # ── Broad Market ─────────────────────────────────────────────────────────
+    "NIFTY":             "Nifty 50",
+    "NIFTY_NEXT50":      "Nifty Next 50",
+    "NIFTY100":          "Nifty 100",
+    "NIFTY200":          "Nifty 200",
+    "NIFTY500":          "Nifty 500",
+    "NIFTYMIDCAP50":     "Nifty Midcap 50",
+    "NIFTYMIDCAP100":    "Nifty Midcap 100",
+    "NIFTYSMALLCAP50":   "Nifty Smallcap 50",
+    "NIFTYSMALLCAP100":  "Nifty Smallcap 100",
+    # ── F&O Tradeable (option chain supported) ────────────────────────────────
+    "BANKNIFTY":         "Nifty Bank",
+    "FINNIFTY":          "Nifty Financial Services",
+    "MIDCPNIFTY":        "Nifty Midcap Select",
+    # ── Sectoral ─────────────────────────────────────────────────────────────
+    "NIFTYIT":           "Nifty IT",
+    "NIFTYAUTO":         "Nifty Auto",
+    "NIFTYPHARMA":       "Nifty Pharma",
+    "NIFTYFMCG":         "Nifty FMCG",
+    "NIFTYMETAL":        "Nifty Metal",
+    "NIFTYREALTY":       "Nifty Realty",
+    "NIFTYENERGY":       "Nifty Energy",
+    "NIFTYPSUBANK":      "Nifty PSU Bank",
+    "NIFTYPVTBANK":      "Nifty Private Bank",
+    "NIFTYMEDIA":        "Nifty Media",
+    "NIFTYHEALTHCARE":   "Nifty Healthcare",
+    "NIFTYOILGAS":       "Nifty Oil & Gas",
+    "NIFTYCONSDUR":      "Nifty Consumer Durables",
+    "NIFTYINFRA":        "Nifty Infrastructure",
+    "NIFTYCPSE":         "Nifty CPSE",
+    # ── BSE ──────────────────────────────────────────────────────────────────
+    "SENSEX":            "BSE Sensex",
+    "BANKEX":            "BSE Bankex",
 }
+
+# F&O-enabled indices (option chain available)
+FNO_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
 
 # Angel One exchange + token for spot LTP and historical candles
 INDEX_ANGEL_TOKENS = {
@@ -143,12 +174,41 @@ INDEX_ANGEL_TOKENS = {
     "SENSEX":     ("BSE", "1"),
 }
 
-# yfinance symbols for indices (for spot price only)
+# yfinance symbols — used as fallback for all indices
 INDEX_YF_SYMBOLS = {
-    "NIFTY":      "^NSEI",
-    "BANKNIFTY":  "^NSEBANK",
-    "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
-    "MIDCPNIFTY": "^NSEMDCP50",
+    # Broad market
+    "NIFTY":            "^NSEI",
+    "NIFTY_NEXT50":     "^NSMIDCP",
+    "NIFTY100":         "^CNX100",
+    "NIFTY200":         "^CNX200",
+    "NIFTY500":         "^CNX500",
+    "NIFTYMIDCAP50":    "NIFTYMIDCAP50.NS",
+    "NIFTYMIDCAP100":   "^NSEMDCP100",
+    "NIFTYSMALLCAP50":  "NIFTYSMALLCAP50.NS",
+    "NIFTYSMALLCAP100": "^NSESMCP100",
+    # F&O
+    "BANKNIFTY":        "^NSEBANK",
+    "FINNIFTY":         "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY":       "^NSEMDCP50",
+    # Sectoral
+    "NIFTYIT":          "^CNXIT",
+    "NIFTYAUTO":        "^CNXAUTO",
+    "NIFTYPHARMA":      "^CNXPHARMA",
+    "NIFTYFMCG":        "^CNXFMCG",
+    "NIFTYMETAL":       "^CNXMETAL",
+    "NIFTYREALTY":      "^CNXREALTY",
+    "NIFTYENERGY":      "^CNXENERGY",
+    "NIFTYPSUBANK":     "^CNXPSUBANK",
+    "NIFTYPVTBANK":     "^CNXPVTBNK",
+    "NIFTYMEDIA":       "^CNXMEDIA",
+    "NIFTYHEALTHCARE":  "^CNXHEALTH",
+    "NIFTYOILGAS":      "^CNXOILGAS",
+    "NIFTYCONSDUR":     "^CNXCONSDUR",
+    "NIFTYINFRA":       "^CNXINFRA",
+    "NIFTYCPSE":        "^CNXCPSE",
+    # BSE
+    "SENSEX":           "^BSESN",
+    "BANKEX":           "^BANKEX",
 }
 
 def search_stocks(query):

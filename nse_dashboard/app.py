@@ -9,13 +9,108 @@ from datetime import datetime
 
 from nse_data import fetch_option_chain, parse_option_chain, generate_signal
 from demo_data import generate_demo_option_chain
-from stock_list import NSE_STOCKS, INDICES, search_stocks
+from stock_list import NSE_STOCKS, INDICES, FNO_INDICES, INDEX_YF_SYMBOLS, search_stocks
 import paper_trade as pt
 import chat_bot
 import backtest
 import model_train
 
-APP_VERSION = "v2.2"
+# ── Technical indicator helpers ───────────────────────────────────────────────
+
+def compute_technicals(df):
+    """
+    Compute VWAP, EMA-9, EMA-20, RSI-14, PVT and Net Volume from an OHLCV
+    DataFrame with columns: datetime, open, high, low, close, volume.
+    Returns a copy with new columns added.
+    """
+    d = df.copy().reset_index(drop=True)
+    # VWAP (cumulative session-style over the full window)
+    hlc3          = (d["high"] + d["low"] + d["close"]) / 3
+    cum_vol       = d["volume"].cumsum().replace(0, np.nan)
+    d["vwap"]     = (hlc3 * d["volume"]).cumsum() / cum_vol
+    # EMA 9 & 20
+    d["ema9"]     = d["close"].ewm(span=9,  adjust=False).mean()
+    d["ema20"]    = d["close"].ewm(span=20, adjust=False).mean()
+    # RSI 14
+    delta         = d["close"].diff()
+    gain          = delta.clip(lower=0)
+    loss          = (-delta).clip(lower=0)
+    avg_gain      = gain.ewm(com=13, min_periods=1).mean()
+    avg_loss      = loss.ewm(com=13, min_periods=1).mean()
+    d["rsi"]      = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-9))
+    # PVT (Price Volume Trend)
+    pct_chg       = d["close"].pct_change().fillna(0)
+    d["pvt"]      = (pct_chg * d["volume"]).cumsum()
+    # Net Volume (positive when close rises, negative when it falls)
+    direction     = np.sign(d["close"].diff().fillna(0))
+    d["net_vol"]  = d["volume"] * direction
+    return d
+
+
+def tech_signal(d):
+    """
+    Derive a BULLISH / BEARISH / NEUTRAL signal from computed_technicals output.
+    Returns (signal_str, color_str, score_int, reasons_list).
+    """
+    if len(d) < 5:
+        return "WAIT", "orange", 0, ["Not enough data"]
+    r    = d.iloc[-1]
+    score   = 0
+    reasons = []
+    # 1. Price vs VWAP
+    if r["close"] > r["vwap"]:
+        score += 1
+        reasons.append("✅ Price {:.1f} > VWAP {:.1f} → Bullish".format(r["close"], r["vwap"]))
+    else:
+        score -= 1
+        reasons.append("❌ Price {:.1f} < VWAP {:.1f} → Bearish".format(r["close"], r["vwap"]))
+    # 2. EMA crossover
+    if r["ema9"] > r["ema20"]:
+        score += 1
+        reasons.append("✅ EMA9 {:.1f} > EMA20 {:.1f} → Bullish crossover".format(r["ema9"], r["ema20"]))
+    else:
+        score -= 1
+        reasons.append("❌ EMA9 {:.1f} < EMA20 {:.1f} → Bearish crossover".format(r["ema9"], r["ema20"]))
+    # 3. RSI
+    rsi_val = float(r["rsi"])
+    if rsi_val > 60:
+        score += 1
+        reasons.append("✅ RSI {:.1f} → Bullish momentum".format(rsi_val))
+    elif rsi_val < 40:
+        score -= 1
+        reasons.append("❌ RSI {:.1f} → Bearish pressure".format(rsi_val))
+    else:
+        reasons.append("⚠️ RSI {:.1f} → Neutral zone (40–60)".format(rsi_val))
+    # 4. PVT trend (3-bar slope)
+    if len(d) >= 4:
+        pvt_slope = float(d["pvt"].iloc[-1] - d["pvt"].iloc[-4])
+        if pvt_slope > 0:
+            score += 1
+            reasons.append("✅ PVT rising → Volume supporting bulls")
+        else:
+            score -= 1
+            reasons.append("❌ PVT falling → Volume supporting bears")
+    # 5. Net Volume (last 3 bars)
+    if len(d) >= 3:
+        net_sum = float(d["net_vol"].iloc[-3:].sum())
+        if net_sum > 0:
+            score += 1
+            reasons.append("✅ Net volume positive → Buying pressure")
+        else:
+            score -= 1
+            reasons.append("❌ Net volume negative → Selling pressure")
+    if score >= 3:
+        return "STRONG BULLISH", "green", score, reasons
+    elif score >= 1:
+        return "BULLISH", "#8BC34A", score, reasons
+    elif score <= -3:
+        return "STRONG BEARISH", "red", score, reasons
+    elif score <= -1:
+        return "BEARISH", "#ef5350", score, reasons
+    return "NEUTRAL", "orange", score, reasons
+
+
+APP_VERSION = "v2.3"
 
 st.set_page_config(
     page_title="NSE Options Intelligence {}".format(APP_VERSION),
@@ -34,8 +129,11 @@ with st.sidebar:
     instrument_type = st.radio("Instrument Type", ["Index", "Stock"])
 
     if instrument_type == "Index":
-        index_options = ["{} — {}".format(k, v) for k, v in INDICES.items()]
-        selected_idx  = st.selectbox("Select Index", index_options)
+        # Only F&O indices have an option chain — others are analysis-only
+        fno_indices   = {k: v for k, v in INDICES.items() if k in FNO_INDICES}
+        index_options = ["{} — {}".format(k, v) for k, v in fno_indices.items()]
+        selected_idx  = st.selectbox("Select Index", index_options,
+                                     help="For all indices go to 🇮🇳 Index Analysis tab")
         symbol        = selected_idx.split(" — ")[0]
         is_index      = True
     else:
@@ -130,6 +228,7 @@ def _get_angelone_data(sym, idx, strikes, range_pts=None):
 
 @st.cache_data(ttl=300)
 def _get_candles(sym, idx, days, src):
+    # 1. Angel One live historical candles
     if src == "Angel One (Live)":
         try:
             from angelone_data import fetch_historical_candles
@@ -138,6 +237,27 @@ def _get_candles(sym, idx, days, src):
                 return c
         except Exception:
             pass
+    # 2. yfinance fallback (works for all NSE/BSE indices without auth)
+    yf_sym = INDEX_YF_SYMBOLS.get(sym.upper())
+    if yf_sym:
+        try:
+            import yfinance as yf
+            tk   = yf.Ticker(yf_sym)
+            hist = tk.history(period="{}d".format(days + 15))
+            if not hist.empty:
+                hist = hist.reset_index()
+                date_col = "Date" if "Date" in hist.columns else "Datetime"
+                return pd.DataFrame({
+                    "datetime": pd.to_datetime(hist[date_col]).dt.tz_localize(None),
+                    "open":     hist["Open"].astype(float),
+                    "high":     hist["High"].astype(float),
+                    "low":      hist["Low"].astype(float),
+                    "close":    hist["Close"].astype(float),
+                    "volume":   hist["Volume"].astype(float),
+                }).tail(days).reset_index(drop=True)
+        except Exception:
+            pass
+    # 3. Synthetic demo fallback
     from demo_data import generate_demo_option_chain
     _, dm  = generate_demo_option_chain(sym if idx else "NIFTY")
     base   = dm["underlying"]
@@ -221,8 +341,8 @@ source_tag = meta.get("source", data_source)
 meta["symbol"] = symbol
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_live, tab_bt, tab_pt, tab_chat = st.tabs(
-    ["📊 Live Dashboard", "📈 Backtest", "💼 Paper Trade", "💬 Chat"]
+tab_live, tab_bt, tab_pt, tab_chat, tab_idx = st.tabs(
+    ["📊 Live Dashboard", "📈 Backtest", "💼 Paper Trade", "💬 Chat", "🇮🇳 Index Analysis"]
 )
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1005,6 +1125,243 @@ with tab_chat:
     if st.button("Clear Chat History", key="clear_chat"):
         st.session_state.chat_history = []
         st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — INDEX ANALYSIS  (VWAP · EMA9/20 · RSI · PVT · Net Volume)
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_idx:
+    from plotly.subplots import make_subplots
+
+    st.markdown("## 🇮🇳 Indian Index Technical Analysis")
+    st.caption(
+        "VWAP · EMA-9 · EMA-20 · RSI-14 · PVT · Net Volume  |  "
+        "Data: Angel One (live) → yfinance (fallback) → Demo"
+    )
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
+    with ctrl1:
+        idx_opts      = ["{} — {}".format(k, v) for k, v in INDICES.items()]
+        idx_sel       = st.selectbox("Select Index", idx_opts, key="ia_idx")
+        ia_symbol     = idx_sel.split(" — ")[0]
+    with ctrl2:
+        ia_days = st.slider("History (days)", 15, 90, 30, step=5, key="ia_days")
+    with ctrl3:
+        ia_fno_note = "✅ F&O index" if ia_symbol in FNO_INDICES else "ℹ️ Spot-only index"
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.info(ia_fno_note)
+
+    # ── Fetch & compute ───────────────────────────────────────────────────────
+    with st.spinner("Fetching {} candles…".format(ia_symbol)):
+        ia_candles = _get_candles(ia_symbol, True, ia_days, data_source)
+
+    if ia_candles is None or ia_candles.empty:
+        st.warning("No candle data available for {}. Try switching to Angel One.".format(ia_symbol))
+    else:
+        ia_tech = compute_technicals(ia_candles)
+        sig_str, sig_col, sig_score, sig_reasons = tech_signal(ia_tech)
+        latest  = ia_tech.iloc[-1]
+        prev    = ia_tech.iloc[-2] if len(ia_tech) > 1 else latest
+        chg_pct = (latest["close"] - prev["close"]) / prev["close"] * 100
+
+        # ── Signal header ─────────────────────────────────────────────────────
+        h1, h2, h3, h4, h5, h6 = st.columns(6)
+        h1.metric("Spot", "₹{:,.2f}".format(latest["close"]),
+                  delta="{:+.2f}%".format(chg_pct))
+        h2.metric("VWAP",  "₹{:,.2f}".format(latest["vwap"]))
+        h3.metric("EMA 9", "₹{:,.2f}".format(latest["ema9"]))
+        h4.metric("EMA 20","₹{:,.2f}".format(latest["ema20"]))
+        h5.metric("RSI 14","{:.1f}".format(latest["rsi"]),
+                  delta="Overbought" if latest["rsi"] > 70 else
+                        ("Oversold" if latest["rsi"] < 30 else "Neutral"))
+        h6.metric("Signal", sig_str)
+
+        st.divider()
+
+        # ── 4-panel technical chart ───────────────────────────────────────────
+        fig_tech = make_subplots(
+            rows=4, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.50, 0.18, 0.16, 0.16],
+            vertical_spacing=0.03,
+            subplot_titles=[
+                "{} — Candles · VWAP · EMA9 · EMA20".format(ia_symbol),
+                "RSI 14",
+                "PVT (Price Volume Trend)",
+                "Net Volume",
+            ],
+        )
+
+        x = ia_tech["datetime"].astype(str)
+
+        # — Panel 1: Candlestick + indicators —
+        fig_tech.add_trace(go.Candlestick(
+            x=x,
+            open=ia_tech["open"], high=ia_tech["high"],
+            low=ia_tech["low"],  close=ia_tech["close"],
+            name="OHLC",
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        ), row=1, col=1)
+        fig_tech.add_trace(go.Scatter(
+            x=x, y=ia_tech["vwap"], name="VWAP",
+            line=dict(color="#FF6F00", width=2, dash="dot"),
+        ), row=1, col=1)
+        fig_tech.add_trace(go.Scatter(
+            x=x, y=ia_tech["ema9"], name="EMA 9",
+            line=dict(color="#42A5F5", width=1.5),
+        ), row=1, col=1)
+        fig_tech.add_trace(go.Scatter(
+            x=x, y=ia_tech["ema20"], name="EMA 20",
+            line=dict(color="#FFA726", width=1.5),
+        ), row=1, col=1)
+
+        # — Panel 2: RSI —
+        fig_tech.add_trace(go.Scatter(
+            x=x, y=ia_tech["rsi"], name="RSI 14",
+            line=dict(color="#CE93D8", width=1.5),
+            fill="tozeroy", fillcolor="rgba(206,147,216,0.08)",
+        ), row=2, col=1)
+        for level, lcolor in [(70, "#ef5350"), (50, "#888"), (30, "#26a69a")]:
+            fig_tech.add_hline(y=level, line_dash="dash", line_color=lcolor,
+                               line_width=1, row=2, col=1)
+
+        # — Panel 3: PVT —
+        pvt_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in ia_tech["pvt"]]
+        fig_tech.add_trace(go.Bar(
+            x=x, y=ia_tech["pvt"], name="PVT",
+            marker_color=pvt_colors, opacity=0.85,
+        ), row=3, col=1)
+
+        # — Panel 4: Net Volume —
+        nv_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in ia_tech["net_vol"]]
+        fig_tech.add_trace(go.Bar(
+            x=x, y=ia_tech["net_vol"], name="Net Vol",
+            marker_color=nv_colors, opacity=0.85,
+        ), row=4, col=1)
+
+        fig_tech.update_layout(
+            height=820,
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=60, b=20, l=60, r=20),
+            legend=dict(orientation="h", y=1.04, x=0),
+            xaxis_rangeslider_visible=False,
+            font=dict(size=11),
+        )
+        for i in range(1, 5):
+            fig_tech.update_xaxes(gridcolor="#333", row=i, col=1)
+            fig_tech.update_yaxes(gridcolor="#333", row=i, col=1)
+
+        st.plotly_chart(fig_tech, use_container_width=True)
+
+        # ── Signal breakdown ──────────────────────────────────────────────────
+        st.divider()
+        sc1, sc2 = st.columns([1, 2])
+        with sc1:
+            bg_map  = {"green":"#1a7a1a","#8BC34A":"#2a4a10","orange":"#7a5c00",
+                       "#ef5350":"#5a1010","red":"#4a0808"}
+            brd_map = {"green":"#4CAF50","#8BC34A":"#8BC34A","orange":"#FF9800",
+                       "#ef5350":"#ef5350","red":"#f44336"}
+            bg  = bg_map.get(sig_col, "#333")
+            brd = brd_map.get(sig_col, "#888")
+            st.markdown(
+                '<div style="background:{};border:3px solid {};padding:24px;'
+                'border-radius:14px;text-align:center;">'
+                '<div style="font-size:13px;color:#ccc;">TECHNICAL SIGNAL</div>'
+                '<div style="font-size:26px;font-weight:bold;color:{};margin:8px 0;">{}</div>'
+                '<div style="font-size:14px;color:#ddd;">Score: {:+d} / 5</div>'
+                '</div>'.format(bg, brd, brd, sig_str, sig_score),
+                unsafe_allow_html=True,
+            )
+        with sc2:
+            st.markdown("#### Indicator Breakdown")
+            for r in sig_reasons:
+                st.markdown(r)
+
+        # ── Index Overview table ──────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 📋 All-Index Overview")
+        st.caption("Fetches last 30 days for each index. May take a few seconds.")
+
+        if st.button("Load All-Index Snapshot", key="ia_overview_btn"):
+            rows = []
+            prog = st.progress(0)
+            idx_list = list(INDICES.items())
+            for i, (sym, name) in enumerate(idx_list):
+                prog.progress((i + 1) / len(idx_list), text=sym)
+                try:
+                    c = _get_candles(sym, True, 30, data_source)
+                    if c is not None and not c.empty:
+                        td = compute_technicals(c)
+                        s, sc, ss, _ = tech_signal(td)
+                        lat = td.iloc[-1]
+                        prv = td.iloc[-2] if len(td) > 1 else lat
+                        chg = (lat["close"] - prv["close"]) / prv["close"] * 100
+                        rows.append({
+                            "Symbol": sym,
+                            "Name":   name,
+                            "Spot ₹": round(lat["close"], 2),
+                            "Chg %":  round(chg, 2),
+                            "EMA9":   round(lat["ema9"], 2),
+                            "EMA20":  round(lat["ema20"], 2),
+                            "VWAP":   round(lat["vwap"], 2),
+                            "RSI":    round(lat["rsi"], 1),
+                            "Signal": s,
+                            "Score":  ss,
+                            "F&O":    "✅" if sym in FNO_INDICES else "",
+                        })
+                except Exception:
+                    pass
+            prog.empty()
+
+            if rows:
+                ov_df = pd.DataFrame(rows)
+
+                def _sig_color(val):
+                    if "BULLISH" in val:  return "color:#26a69a;font-weight:bold"
+                    if "BEARISH" in val:  return "color:#ef5350;font-weight:bold"
+                    return "color:#FF9800"
+
+                def _chg_color(val):
+                    return "color:#26a69a" if val >= 0 else "color:#ef5350"
+
+                st.dataframe(
+                    ov_df.style
+                        .applymap(_sig_color, subset=["Signal"])
+                        .applymap(_chg_color, subset=["Chg %"])
+                        .format({"Spot ₹": "{:,.2f}", "EMA9": "{:,.2f}",
+                                 "EMA20": "{:,.2f}", "VWAP": "{:,.2f}",
+                                 "RSI": "{:.1f}", "Chg %": "{:+.2f}%"}),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=560,
+                )
+
+                # Quick bar chart — RSI across indices
+                fig_rsi = go.Figure(go.Bar(
+                    x=ov_df["Symbol"],
+                    y=ov_df["RSI"],
+                    marker_color=[
+                        "#ef5350" if v > 70 else "#26a69a" if v < 30 else "#42A5F5"
+                        for v in ov_df["RSI"]
+                    ],
+                    name="RSI 14",
+                ))
+                fig_rsi.add_hline(y=70, line_dash="dash", line_color="#ef5350", line_width=1)
+                fig_rsi.add_hline(y=30, line_dash="dash", line_color="#26a69a", line_width=1)
+                fig_rsi.add_hline(y=50, line_dash="dot",  line_color="#888",    line_width=1)
+                fig_rsi.update_layout(
+                    title="RSI 14 Across All Indian Indices",
+                    height=320,
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(gridcolor="#333", tickangle=-45),
+                    yaxis=dict(gridcolor="#333", range=[0, 100]),
+                    margin=dict(t=40, b=60),
+                )
+                st.plotly_chart(fig_rsi, use_container_width=True)
+            else:
+                st.warning("Could not fetch data for any index. Check data source.")
 
 
 # ── Auto Refresh ──────────────────────────────────────────────────────────────
