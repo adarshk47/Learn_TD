@@ -38,6 +38,12 @@ def compute_technicals(df):
     avg_gain      = gain.ewm(com=13, min_periods=1).mean()
     avg_loss      = loss.ewm(com=13, min_periods=1).mean()
     d["rsi"]      = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-9))
+    # MACD (12, 26, 9)
+    ema12          = d["close"].ewm(span=12, adjust=False).mean()
+    ema26          = d["close"].ewm(span=26, adjust=False).mean()
+    d["macd"]      = ema12 - ema26
+    d["macd_sig"]  = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_sig"]
     # PVT (Price Volume Trend)
     pct_chg       = d["close"].pct_change().fillna(0)
     d["pvt"]      = (pct_chg * d["volume"]).cumsum()
@@ -110,7 +116,182 @@ def tech_signal(d):
     return "NEUTRAL", "orange", score, reasons
 
 
-APP_VERSION = "v2.3"
+_STRIKE_STEP = {
+    "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50,
+    "MIDCPNIFTY": 25, "SENSEX": 100,
+}
+
+def _parse_expiry_date(expiry_str):
+    """Return a date object from any common expiry string, or None."""
+    from datetime import date as _date
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d %b %Y", "%d-%B-%Y", "%d%b%Y"):
+        try:
+            return datetime.strptime(expiry_str.upper(), fmt.upper()).date()
+        except Exception:
+            pass
+    return None
+
+
+def generate_trade_setups(oi_sig, tech_df, underlying, expiry, symbol):
+    """
+    Combine OI signal + MACD + RSI + EMA + VWAP + PVT into per-timeframe
+    trade setup cards: 10min / 15min / 30min / 1hr.
+
+    Returns dict  tf → {direction, confidence, strike, premium_est,
+                         sl_pct, tgt_pct, dte, dte_note, score, bullets}
+    """
+    from datetime import date as _date
+    TIMEFRAMES = ["10min", "15min", "30min", "1hr"]
+
+    # ── DTE calculation ───────────────────────────────────────────────────────
+    exp_date = _parse_expiry_date(expiry)
+    dte = int((exp_date - _date.today()).days) if exp_date else 7
+    dte = max(0, dte)
+
+    # ── DTE risk profile (SL%, Target%) ──────────────────────────────────────
+    if dte == 0:
+        dte_note = "🔴 EXPIRY DAY — Avoid option buys (max theta risk)"
+        dte_sl, dte_tgt = 15, 20
+    elif dte == 1:
+        dte_note = "⚠️ 1 DTE — Scalp only, very tight size"
+        dte_sl, dte_tgt = 20, 30
+    elif dte <= 3:
+        dte_note = "⏳ {} DTE — Short-expiry scalp, ATM preferred".format(dte)
+        dte_sl, dte_tgt = 30, 50
+    elif dte <= 7:
+        dte_note = "📅 {} DTE — Weekly expiry window, intraday/swing OK".format(dte)
+        dte_sl, dte_tgt = 35, 65
+    else:
+        dte_note = "📆 {} DTE — Positional friendly, spreads recommended".format(dte)
+        dte_sl, dte_tgt = 40, 80
+
+    # ── Technical composite score (from intraday candles) ────────────────────
+    ts      = 0
+    bullets = []
+
+    if tech_df is not None and not tech_df.empty and len(tech_df) >= 5:
+        r    = tech_df.iloc[-1]
+        prev = tech_df.iloc[-2]
+
+        # 1. MACD
+        macd_val  = float(r.get("macd",     r.get("macd",     0)))
+        macd_sig  = float(r.get("macd_sig", r.get("macd_signal", 0)))
+        macd_hist = float(r.get("macd_hist", 0))
+        if macd_val > macd_sig:
+            ts += 2
+            strength = "rising ↑" if macd_hist > float(prev.get("macd_hist", 0)) else "above signal"
+            bullets.append("✅ MACD {} → Bullish".format(strength))
+        else:
+            ts -= 2
+            bullets.append("❌ MACD below signal → Bearish")
+
+        # 2. RSI
+        rsi_v = float(r.get("rsi", r.get("rsi14", 50)))
+        if rsi_v > 65:
+            ts += 2; bullets.append("✅ RSI {:.0f} → Strong bullish momentum".format(rsi_v))
+        elif rsi_v > 55:
+            ts += 1; bullets.append("✅ RSI {:.0f} → Mild bullish".format(rsi_v))
+        elif rsi_v < 35:
+            ts -= 2; bullets.append("❌ RSI {:.0f} → Strong bearish pressure".format(rsi_v))
+        elif rsi_v < 45:
+            ts -= 1; bullets.append("❌ RSI {:.0f} → Mild bearish".format(rsi_v))
+        else:
+            bullets.append("⚪ RSI {:.0f} → Neutral".format(rsi_v))
+
+        # 3. EMA crossover
+        e9, e20 = float(r.get("ema9", 0)), float(r.get("ema20", r.get("ema21", 0)))
+        if e9 > e20:
+            ts += 1; bullets.append("✅ EMA9 > EMA20 → Uptrend")
+        else:
+            ts -= 1; bullets.append("❌ EMA9 < EMA20 → Downtrend")
+
+        # 4. Price vs VWAP
+        close_v, vwap_v = float(r.get("close", 0)), float(r.get("vwap", 0))
+        if vwap_v > 0:
+            if close_v > vwap_v:
+                ts += 1; bullets.append("✅ Price above VWAP → Intraday bullish")
+            else:
+                ts -= 1; bullets.append("❌ Price below VWAP → Intraday bearish")
+
+        # 5. PVT slope (3-bar)
+        if "pvt" in tech_df.columns and len(tech_df) >= 4:
+            pvt_slope = float(tech_df["pvt"].iloc[-1] - tech_df["pvt"].iloc[-4])
+            if pvt_slope > 0:
+                ts += 1; bullets.append("✅ PVT rising → Volume confirming bulls")
+            else:
+                ts -= 1; bullets.append("❌ PVT falling → Volume confirming bears")
+
+    else:
+        bullets.append("⚠️ Intraday candles unavailable — using OI signal only")
+
+    # ── OI signal score (normalised to ±5) ───────────────────────────────────
+    oi_raw   = oi_sig.get("score", 0)
+    oi_norm  = max(-5, min(5, round(oi_raw / 20)))
+    oi_dir   = oi_sig.get("signal", "AVOID / WAIT")
+    oi_pcr   = oi_sig.get("pcr", 1.0)
+    bullets.append("📊 OI score {:+d} (PCR={}, Signal: {})".format(oi_norm, oi_pcr, oi_dir))
+
+    combined = ts + oi_norm  # range: about -12 to +12
+
+    # ── Direction ─────────────────────────────────────────────────────────────
+    if combined >= 3:
+        direction, dir_col = "BUY CE 🟢", "green"
+    elif combined <= -3:
+        direction, dir_col = "BUY PE 🔴", "red"
+    elif combined >= 1:
+        direction, dir_col = "MILD BULLISH ↑", "#8BC34A"
+    elif combined <= -1:
+        direction, dir_col = "MILD BEARISH ↓", "#ef5350"
+    else:
+        direction, dir_col = "WAIT / NEUTRAL ⚪", "orange"
+
+    # ── Strike selection ──────────────────────────────────────────────────────
+    step = _STRIKE_STEP.get(symbol.upper(), 50)
+    atm  = round(underlying / step) * step
+    if abs(combined) >= 6:
+        rec_strike = atm                     # ATM — max gamma
+    elif abs(combined) >= 3:
+        rec_strike = (atm + step) if combined > 0 else (atm - step)  # 1 OTM
+    else:
+        rec_strike = atm
+
+    premium_est = round(underlying * 0.008, 0)   # ~0.8% ATM premium estimate
+    confidence  = min(92, max(10, 50 + combined * 6))
+
+    # ── Per-timeframe SL/Target multipliers ──────────────────────────────────
+    tf_mults = {
+        "10min": (0.50, 0.45, "Scalp   ~10 min"),
+        "15min": (0.65, 0.60, "Scalp   ~15 min"),
+        "30min": (0.80, 0.75, "Intraday 30 min"),
+        "1hr":   (1.00, 1.00, "Intraday  1 hr "),
+    }
+
+    setups = {}
+    for tf in TIMEFRAMES:
+        sl_m, tgt_m, tf_label = tf_mults[tf]
+        sl_pct  = round(dte_sl  * sl_m,  1)
+        tgt_pct = round(dte_tgt * tgt_m, 1)
+        setups[tf] = {
+            "label":        tf_label,
+            "direction":    direction,
+            "dir_col":      dir_col,
+            "confidence":   confidence,
+            "combined":     combined,
+            "tech_score":   ts,
+            "oi_score":     oi_norm,
+            "atm":          atm,
+            "rec_strike":   rec_strike,
+            "premium_est":  premium_est,
+            "sl_pct":       sl_pct,
+            "tgt_pct":      tgt_pct,
+            "dte":          dte,
+            "dte_note":     dte_note,
+            "bullets":      bullets,
+        }
+    return setups
+
+
+APP_VERSION = "v2.4"
 
 st.set_page_config(
     page_title="NSE Options Intelligence {}".format(APP_VERSION),
@@ -274,6 +455,49 @@ def _get_candles(sym, idx, days, src):
         "volume":   np.random.randint(100000, 500000, days).astype(float),
     })
 
+@st.cache_data(ttl=60)
+def _get_intraday_candles_cached(sym, tf, src):
+    """
+    Fetch intraday OHLCV for the live-dashboard trade-setup panel.
+    Tries Angel One first, then yfinance intraday, then returns empty.
+    tf: '5min' | '10min' | '15min' | '30min' | '1hr'
+    """
+    # 1. Angel One
+    if src == "Angel One (Live)":
+        try:
+            from angelone_data import fetch_intraday_candles
+            c = fetch_intraday_candles(sym, True, tf)
+            if c is not None and not c.empty:
+                return c
+        except Exception:
+            pass
+    # 2. yfinance intraday
+    yf_sym = INDEX_YF_SYMBOLS.get(sym.upper())
+    if yf_sym:
+        try:
+            import yfinance as yf
+            yf_interval = {"5min": "5m", "10min": "10m", "15min": "15m",
+                           "30min": "30m", "1hr": "60m"}.get(tf, "15m")
+            yf_period   = {"5min": "1d", "10min": "2d", "15min": "5d",
+                           "30min": "10d", "1hr": "20d"}.get(tf, "5d")
+            tk   = yf.Ticker(yf_sym)
+            hist = tk.history(period=yf_period, interval=yf_interval)
+            if not hist.empty:
+                hist = hist.reset_index()
+                dc   = "Datetime" if "Datetime" in hist.columns else "Date"
+                return pd.DataFrame({
+                    "datetime": pd.to_datetime(hist[dc]).dt.tz_localize(None),
+                    "open":    hist["Open"].astype(float),
+                    "high":    hist["High"].astype(float),
+                    "low":     hist["Low"].astype(float),
+                    "close":   hist["Close"].astype(float),
+                    "volume":  hist["Volume"].astype(float),
+                }).dropna(subset=["close"]).reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
 # ── Data fetch ────────────────────────────────────────────────────────────────
 
 df   = pd.DataFrame()
@@ -349,11 +573,105 @@ tab_live, tab_bt, tab_pt, tab_chat, tab_idx = st.tabs(
 # TAB 1 — LIVE DASHBOARD
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_live:
+    # ── Header ────────────────────────────────────────────────────────────────
     st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
-    st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
-        underlying, meta["atm"], source_tag))
+    st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`  |  `{}`".format(
+        underlying, meta["atm"], source_tag, datetime.now().strftime("%H:%M:%S")))
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION A — MULTI-TIMEFRAME TRADE SETUP
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 🎯 Live Trade Setup")
+
+    # Fetch 15-min intraday candles for technical analysis
+    with st.spinner("Loading intraday technicals…"):
+        intra_raw   = _get_intraday_candles_cached(symbol, "15min", data_source)
+        intra_tech  = compute_technicals(intra_raw) if not intra_raw.empty else pd.DataFrame()
+
+    setups = generate_trade_setups(sig, intra_tech, underlying, expiry, symbol)
+
+    if setups:
+        # DTE warning banner
+        dte_val  = list(setups.values())[0]["dte"]
+        dte_note = list(setups.values())[0]["dte_note"]
+        if dte_val <= 1:
+            st.error(dte_note)
+        elif dte_val <= 3:
+            st.warning(dte_note)
+        else:
+            st.info(dte_note)
+
+        # 4 timeframe cards
+        tf_cols = st.columns(4)
+        tf_order = ["10min", "15min", "30min", "1hr"]
+        for col, tf in zip(tf_cols, tf_order):
+            s = setups[tf]
+            bg_c  = {"green": "#0d2e0d", "red": "#2e0d0d",
+                     "#8BC34A": "#1a2e0d", "#ef5350": "#2e1010", "orange": "#2e2200"}
+            brd_c = {"green": "#4CAF50", "red": "#f44336",
+                     "#8BC34A": "#8BC34A", "#ef5350": "#ef5350", "orange": "#FF9800"}
+            bg  = bg_c.get(s["dir_col"],  "#1e1e2e")
+            brd = brd_c.get(s["dir_col"], "#888")
+            col.markdown(
+                '<div style="background:{bg};border:2px solid {brd};padding:14px;'
+                'border-radius:12px;text-align:center;margin-bottom:4px;">'
+                '<div style="color:#aaa;font-size:11px;letter-spacing:1px;">{label}</div>'
+                '<div style="color:{brd};font-size:17px;font-weight:bold;margin:6px 0">{dir}</div>'
+                '<div style="color:#ccc;font-size:12px;">Strike: <b>₹{strike:,.0f}</b></div>'
+                '<div style="color:#ccc;font-size:12px;">Entry ~<b>₹{prem:.0f}</b></div>'
+                '<div style="color:#ef5350;font-size:12px;">SL: <b>{sl}%</b></div>'
+                '<div style="color:#26a69a;font-size:12px;">Tgt: <b>{tgt}%</b></div>'
+                '<div style="color:#FFD700;font-size:13px;margin-top:6px;font-weight:bold;">'
+                'Conf: {conf}%</div>'
+                '</div>'.format(
+                    bg=bg, brd=brd,
+                    label=s["label"].strip(),
+                    dir=s["direction"],
+                    strike=s["rec_strike"],
+                    prem=s["premium_est"],
+                    sl=s["sl_pct"], tgt=s["tgt_pct"],
+                    conf=s["confidence"],
+                ),
+                unsafe_allow_html=True,
+            )
+
+        # Score breakdown
+        st.divider()
+        score_col, detail_col = st.columns([1, 2])
+        with score_col:
+            first = list(setups.values())[0]
+            ts_v, oi_v, tot_v = first["tech_score"], first["oi_score"], first["combined"]
+            score_color = "#4CAF50" if tot_v > 0 else "#ef5350" if tot_v < 0 else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
+                '<div style="color:#aaa;font-size:12px;">COMPOSITE SCORE</div>'
+                '<div style="font-size:40px;font-weight:bold;color:{c};">{t:+d}</div>'
+                '<div style="color:#ccc;font-size:12px;margin-top:8px;">'
+                'Tech: <b style="color:{tc}">{ts:+d}</b> &nbsp;|&nbsp; '
+                'OI: <b style="color:{oc}">{oi:+d}</b>'
+                '</div>'
+                '<div style="color:#aaa;font-size:11px;margin-top:6px;">'
+                '(+12 Strong Bull → −12 Strong Bear)</div>'
+                '</div>'.format(
+                    c=score_color, t=tot_v,
+                    tc="#4CAF50" if ts_v > 0 else "#ef5350",
+                    ts=ts_v,
+                    oc="#4CAF50" if oi_v > 0 else "#ef5350",
+                    oi=oi_v,
+                ),
+                unsafe_allow_html=True,
+            )
+        with detail_col:
+            st.markdown("##### Indicator Breakdown (15-min candles + OI)")
+            for b in first["bullets"]:
+                st.markdown(b)
+
     st.divider()
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION B — MARKET METRICS + OI INTELLIGENCE
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 📊 Market Metrics")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot Price",    "₹{:,.1f}".format(underlying))
     c2.metric("PCR",           str(pcr), delta="Bullish" if pcr > 1.0 else "Bearish")
@@ -361,12 +679,12 @@ with tab_live:
     c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
     c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
 
-    # ── OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) ─
     oi1, oi2, oi3, oi4, oi5 = st.columns(5)
     call_sum_v = sig.get("call_sum", 0)
     put_sum_v  = sig.get("put_sum", 0)
     oi_diff_v  = sig.get("oi_difference", 0)
     itm_r      = sig.get("itm_ratio", 0)
+    strat_type = sig.get("strategy_type", "WAIT")
     oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
                delta="CE writing ↑" if call_sum_v > 0 else "CE covering ↓")
     oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
@@ -375,68 +693,155 @@ with tab_live:
                delta="Bearish" if oi_diff_v > 0 else "Bullish")
     oi4.metric("ITM Ratio", "{:.2f}x".format(itm_r),
                delta="Bullish" if itm_r > 1.5 else ("Bearish" if itm_r < 0.67 and itm_r > 0 else "Neutral"))
-    strat_type = sig.get("strategy_type", "WAIT")
     oi5.metric("Suggested Strategy", strat_type)
+
     st.divider()
 
-    sig_col, reason_col = st.columns([1, 2])
-    with sig_col:
-        bg     = {"green": "#1a7a1a", "red": "#8b1a1a", "orange": "#7a5c00"}.get(sig["color"], "#333")
-        border = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(sig["color"], "#888")
-        st.markdown(
-            '<div style="background:{};border:3px solid {};padding:25px;border-radius:14px;text-align:center;">'
-            '<div style="font-size:14px;color:#ccc;margin-bottom:6px;">TRADE SIGNAL</div>'
-            '<div style="font-size:32px;font-weight:bold;color:{};">{}</div>'
-            '<div style="font-size:16px;color:#ddd;margin-top:8px;">Confidence</div>'
-            '<div style="font-size:42px;font-weight:bold;color:white;">{}%</div>'
-            '</div>'.format(bg, border, border, sig["signal"], sig["confidence"]),
-            unsafe_allow_html=True
-        )
-        fig_g = go.Figure(go.Indicator(
-            mode="gauge+number", value=sig["confidence"],
-            title={"text": "Signal Strength", "font": {"size": 14}},
-            gauge={
-                "axis": {"range": [0, 100]}, "bar": {"color": border},
-                "steps": [
-                    {"range": [0,  40], "color": "#3d0000"},
-                    {"range": [40, 65], "color": "#3d3d00"},
-                    {"range": [65,100], "color": "#003d00"},
-                ],
-                "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.8, "value": sig["confidence"]},
-            },
-            number={"suffix": "%"},
-        ))
-        fig_g.update_layout(height=200, margin=dict(t=30, b=0, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig_g, use_container_width=True)
-
-    with reason_col:
-        st.markdown("#### Analysis Breakdown")
-        for r in sig["reasons"]:
-            rl   = r.lower()
-            icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
-                   "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "🟡"
-            st.markdown(icon + " " + r)
-        st.markdown("---")
-        st.markdown("#### Key Levels")
-        st.dataframe(pd.DataFrame({
-            "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
-            "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
-        }), hide_index=True, use_container_width=True)
-        st.markdown("---")
-        strat_note = sig.get("strategy_note", "")
-        if strat_note:
-            st.markdown("#### Strategy Recommendation")
-            strat_col = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
-                        "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
+    # ── OI Signal analysis (collapsible) ─────────────────────────────────────
+    with st.expander("📋 OI Signal Analysis & Key Levels", expanded=False):
+        sig_col, reason_col = st.columns([1, 2])
+        with sig_col:
+            bg     = {"green": "#1a7a1a", "red": "#8b1a1a", "orange": "#7a5c00"}.get(sig["color"], "#333")
+            border = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(sig["color"], "#888")
             st.markdown(
-                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;border-left:4px solid {};">'
-                '<b style="color:{};">{}</b><br><span style="color:#ccc;font-size:13px;">{}</span>'
-                '</div>'.format(strat_col, strat_col, strat_type, strat_note),
+                '<div style="background:{};border:3px solid {};padding:25px;border-radius:14px;text-align:center;">'
+                '<div style="font-size:14px;color:#ccc;margin-bottom:6px;">OI SIGNAL</div>'
+                '<div style="font-size:28px;font-weight:bold;color:{};">{}</div>'
+                '<div style="font-size:16px;color:#ddd;margin-top:8px;">Confidence</div>'
+                '<div style="font-size:42px;font-weight:bold;color:white;">{}%</div>'
+                '</div>'.format(bg, border, border, sig["signal"], sig["confidence"]),
                 unsafe_allow_html=True
             )
+            fig_g = go.Figure(go.Indicator(
+                mode="gauge+number", value=sig["confidence"],
+                title={"text": "OI Signal Strength", "font": {"size": 13}},
+                gauge={
+                    "axis": {"range": [0, 100]}, "bar": {"color": border},
+                    "steps": [
+                        {"range": [0,  40], "color": "#3d0000"},
+                        {"range": [40, 65], "color": "#3d3d00"},
+                        {"range": [65,100], "color": "#003d00"},
+                    ],
+                    "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.8, "value": sig["confidence"]},
+                },
+                number={"suffix": "%"},
+            ))
+            fig_g.update_layout(height=200, margin=dict(t=30, b=0, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_g, use_container_width=True)
+        with reason_col:
+            st.markdown("##### OI Factors")
+            for r in sig["reasons"]:
+                rl   = r.lower()
+                icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
+                       "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "🟡"
+                st.markdown(icon + " " + r)
+            st.markdown("---")
+            st.dataframe(pd.DataFrame({
+                "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
+                "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
+            }), hide_index=True, use_container_width=True)
+            strat_note = sig.get("strategy_note", "")
+            if strat_note:
+                strat_c = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
+                          "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
+                st.markdown(
+                    '<div style="background:#1e1e2e;padding:10px;border-radius:8px;border-left:4px solid {};">'
+                    '<b style="color:{};">{}</b><br>'
+                    '<span style="color:#ccc;font-size:13px;">{}</span>'
+                    '</div>'.format(strat_c, strat_c, strat_type, strat_note),
+                    unsafe_allow_html=True
+                )
 
     st.divider()
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION C — INTRADAY TECHNICAL CHART (MACD + RSI + EMA + VWAP)
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 📈 Intraday Technical Chart")
+
+    # Intraday timeframe selector for the chart
+    chart_tf = st.radio(
+        "Chart Interval", ["5min", "10min", "15min", "30min", "1hr"],
+        index=2, horizontal=True, key="live_chart_tf",
+        help="Fetch intraday candles at this interval for MACD/RSI/VWAP/EMA chart"
+    )
+    if chart_tf != "15min":
+        chart_raw  = _get_intraday_candles_cached(symbol, chart_tf, data_source)
+        chart_tech = compute_technicals(chart_raw) if not chart_raw.empty else intra_tech
+    else:
+        chart_raw  = intra_raw
+        chart_tech = intra_tech
+
+    if chart_tech is not None and not chart_tech.empty and len(chart_tech) >= 5:
+        from plotly.subplots import make_subplots as _msp
+        xc = chart_tech["datetime"].astype(str)
+        fig_intra = _msp(
+            rows=4, cols=1, shared_xaxes=True,
+            row_heights=[0.48, 0.18, 0.18, 0.16],
+            vertical_spacing=0.025,
+            subplot_titles=[
+                "Price · VWAP (orange) · EMA9 (blue) · EMA20 (amber)",
+                "MACD (12,26,9)",
+                "RSI 14",
+                "Net Volume",
+            ],
+        )
+        # Panel 1 — Candles + indicators
+        fig_intra.add_trace(go.Candlestick(
+            x=xc, open=chart_tech["open"], high=chart_tech["high"],
+            low=chart_tech["low"], close=chart_tech["close"], name="OHLC",
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        ), row=1, col=1)
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["vwap"], name="VWAP",
+            line=dict(color="#FF6F00", width=1.5, dash="dot")), row=1, col=1)
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["ema9"],  name="EMA9",
+            line=dict(color="#42A5F5", width=1.5)), row=1, col=1)
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["ema20"], name="EMA20",
+            line=dict(color="#FFA726", width=1.5)), row=1, col=1)
+        # Panel 2 — MACD
+        hist_col = ["#26a69a" if v >= 0 else "#ef5350" for v in chart_tech["macd_hist"]]
+        fig_intra.add_trace(go.Bar(x=xc, y=chart_tech["macd_hist"], name="MACD Hist",
+            marker_color=hist_col, opacity=0.7), row=2, col=1)
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["macd"],     name="MACD",
+            line=dict(color="#42A5F5", width=1.5)), row=2, col=1)
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["macd_sig"], name="Signal",
+            line=dict(color="#FFA726", width=1.5)), row=2, col=1)
+        fig_intra.add_hline(y=0, line_dash="dash", line_color="#555", row=2, col=1)
+        # Panel 3 — RSI
+        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["rsi"], name="RSI 14",
+            line=dict(color="#CE93D8", width=1.5),
+            fill="tozeroy", fillcolor="rgba(206,147,216,0.08)"), row=3, col=1)
+        for lvl, lc in [(70, "#ef5350"), (50, "#888"), (30, "#26a69a")]:
+            fig_intra.add_hline(y=lvl, line_dash="dash", line_color=lc,
+                                line_width=1, row=3, col=1)
+        # Panel 4 — Net Volume
+        nv_col = ["#26a69a" if v >= 0 else "#ef5350" for v in chart_tech["net_vol"]]
+        fig_intra.add_trace(go.Bar(x=xc, y=chart_tech["net_vol"], name="Net Vol",
+            marker_color=nv_col, opacity=0.8), row=4, col=1)
+
+        fig_intra.update_layout(
+            height=780, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(t=50, b=10, l=60, r=10),
+            legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
+            xaxis_rangeslider_visible=False,
+        )
+        for i in range(1, 5):
+            fig_intra.update_xaxes(gridcolor="#333", row=i, col=1)
+            fig_intra.update_yaxes(gridcolor="#333", row=i, col=1)
+        st.plotly_chart(fig_intra, use_container_width=True)
+    else:
+        st.info(
+            "Intraday candle data unavailable for this interval/source.\n\n"
+            "**Angel One (Live)** provides real 5/15/30-min candles. "
+            "**yfinance fallback** works for most NSE indices but may be delayed."
+        )
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION D — OI CHARTS
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 📊 Open Interest Analysis")
     cc1, cc2 = st.columns(2)
     with cc1:
         st.markdown("#### Open Interest Distribution")

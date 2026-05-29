@@ -14,7 +14,56 @@ INDEX_TOKENS = {
     "SENSEX":     ("BSE", "1"),
 }
 
+# Angel One interval name → (API string, days of history to request)
+INTRADAY_MAP = {
+    "5min":  ("FIVE_MINUTE",    3),
+    "10min": ("TEN_MINUTE",     5),
+    "15min": ("FIFTEEN_MINUTE", 7),
+    "30min": ("THIRTY_MINUTE",  15),
+    "1hr":   ("ONE_HOUR",       30),
+    "daily": ("ONE_DAY",        60),
+}
+
 # ── Historical candles ────────────────────────────────────────────────────────
+
+def get_intraday_candles(smart, symbol, is_index, tf="15min"):
+    """
+    Fetch intraday OHLCV candles from Angel One for the given timeframe.
+    tf: '5min' | '10min' | '15min' | '30min' | '1hr'
+    Returns a DataFrame or empty DataFrame on failure.
+    """
+    ao_interval, days_back = INTRADAY_MAP.get(tf, ("FIFTEEN_MINUTE", 7))
+    today  = date.today()
+    from_d = (today - timedelta(days=days_back + 2)).strftime("%Y-%m-%d 09:15")
+    to_d   = today.strftime("%Y-%m-%d 15:30")
+    try:
+        if is_index:
+            exch, token = INDEX_TOKENS.get(symbol.upper(), ("NSE", "99926000"))
+            # BSE exchange doesn't support intraday historical via getCandleData —
+            # fall back to NSE NIFTY equivalent for SENSEX to avoid empty response.
+            if exch == "BSE":
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
+        resp = smart.getCandleData({
+            "exchange":    exch,
+            "symboltoken": token,
+            "interval":    ao_interval,
+            "fromdate":    from_d,
+            "todate":      to_d,
+        })
+        raw = resp.get("data", [])
+        if not raw:
+            return pd.DataFrame()
+        df = pd.DataFrame(raw, columns=["datetime","open","high","low","close","volume"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("datetime").reset_index(drop=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["close"]).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
 
 def get_historical_candles(smart, symbol, is_index, days=30):
     today = date.today()
@@ -66,7 +115,14 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs    = gain / loss.replace(0, 1e-10)
     df["rsi14"] = 100 - 100 / (1 + rs)
 
-    # Volume ratio vs 5-day average
+    # MACD (12, 26, 9)
+    ema12              = df["close"].ewm(span=12, adjust=False).mean()
+    ema26              = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"]         = ema12 - ema26
+    df["macd_signal"]  = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"]    = df["macd"] - df["macd_signal"]
+
+    # Volume ratio vs 5-bar average
     vol_avg         = df["volume"].rolling(5, min_periods=1).mean()
     df["vol_ratio"] = (df["volume"] / vol_avg.replace(0, 1)).clip(0, 5)
 

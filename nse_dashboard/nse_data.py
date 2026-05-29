@@ -3,11 +3,20 @@ import time
 import requests
 
 _HEADERS = {
-    "user-agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "accept":          "*/*",
-    "accept-language": "en,gu;q=0.9,hi;q=0.8",
-    "accept-encoding": "gzip, deflate, br",
-    "referer":         "https://www.nseindia.com/option-chain",
+    "user-agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 "Chrome/124.0.0.0 Safari/537.36",
+    "accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                                 "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "accept-language":           "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "accept-encoding":           "gzip, deflate, br",
+    "connection":                "keep-alive",
+    "upgrade-insecure-requests": "1",
+    "sec-fetch-dest":            "document",
+    "sec-fetch-mode":            "navigate",
+    "sec-fetch-site":            "same-origin",
+    "referer":                   "https://www.nseindia.com/option-chain",
+    "cache-control":             "no-cache",
 }
 
 _session      = None
@@ -16,10 +25,19 @@ _session_time = 0
 
 def _build_session():
     s = requests.Session()
-    s.get("https://www.nseindia.com",              headers=_HEADERS, timeout=10)
-    time.sleep(2)
-    s.get("https://www.nseindia.com/option-chain", headers=_HEADERS, timeout=10)
-    time.sleep(1)
+    # Warmup: NSE requires two cookie-setting GETs before the API call works.
+    # This fails on non-Indian IPs (Streamlit Cloud / overseas servers) — use
+    # Angel One (Live) or Demo Mode when hosted outside India.
+    try:
+        s.get("https://www.nseindia.com",              headers=_HEADERS, timeout=12)
+        time.sleep(2)
+        s.get("https://www.nseindia.com/option-chain", headers=_HEADERS, timeout=12)
+        time.sleep(1)
+        s.get("https://www.nseindia.com/get-quotes/derivatives?symbol=NIFTY",
+              headers=_HEADERS, timeout=10)
+        time.sleep(0.5)
+    except Exception:
+        pass  # proceed with whatever cookies were set
     return s
 
 
@@ -39,20 +57,39 @@ def fetch_option_chain(symbol, is_index=True):
     else:
         url = "https://www.nseindia.com/api/option-chain-equities?symbol={}".format(symbol)
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             r = _session.get(url, headers=_HEADERS, timeout=15)
-            if r.status_code in (401, 403, 404):
+            if r.status_code == 401:
                 _reset_session()
+                time.sleep(2)
                 continue
+            if r.status_code in (403, 429):
+                return {
+                    "error": (
+                        "NSE blocked this request (HTTP {}). "
+                        "NSE Direct requires an Indian IP address — it does not work on "
+                        "Streamlit Cloud or overseas servers. "
+                        "Switch to Angel One (Live) or Demo Mode."
+                    ).format(r.status_code)
+                }
+            if r.status_code == 404:
+                return {"error": "NSE returned 404 — symbol not found or market closed."}
             r.raise_for_status()
             return r.json()
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                _reset_session()
+                time.sleep(2)
+            else:
+                return {"error": "NSE request timed out. Check your internet connection or switch to Angel One."}
         except Exception as e:
             if attempt == 0:
                 _reset_session()
+                time.sleep(1)
             else:
-                return {"error": str(e)}
-    return {"error": "NSE fetch failed after retry"}
+                return {"error": "NSE fetch failed: {}".format(str(e))}
+    return {"error": "NSE fetch failed after 3 attempts. Use Angel One (Live) instead."}
 
 
 def parse_option_chain(data, num_strikes=20):

@@ -180,6 +180,20 @@ def fetch_historical_candles(symbol, is_index=True, days=30):
     return get_historical_candles(smart, symbol, is_index, days)
 
 
+def fetch_intraday_candles(symbol, is_index=True, tf="15min"):
+    """
+    Wrapper: get intraday OHLCV for live-dashboard multi-timeframe analysis.
+    tf: '5min' | '10min' | '15min' | '30min' | '1hr'
+    Returns DataFrame or None on auth failure.
+    """
+    try:
+        smart = _get_session()
+    except Exception:
+        return None
+    from backtest import get_intraday_candles
+    return get_intraday_candles(smart, symbol, is_index, tf)
+
+
 def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20, strike_range_pts=None):
     """
     Returns (df, meta) with same schema as nse_data.parse_option_chain.
