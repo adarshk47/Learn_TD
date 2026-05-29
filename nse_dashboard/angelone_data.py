@@ -349,7 +349,7 @@ def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20, strike_ra
     meta = {
         "underlying":   underlying,
         "expiry":       exp_display,
-        "all_expiries": [_exp_to_date(e).strftime("%d-%b-%Y").upper() for e in all_expiries[:5]],
+        "all_expiries": [(_parse_date(e) or date.today()).strftime("%d-%b-%Y").upper() for e in all_expiries[:5]],
         "atm":          atm,
         "source":       "Angel One SmartAPI",
     }
