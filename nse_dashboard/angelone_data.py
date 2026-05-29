@@ -72,19 +72,23 @@ def _load_instruments():
                 return json.load(f)
         return []
 
+def _parse_date(s):
+    """Parse a date string in any of Angel One's formats. Returns date or None."""
+    for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%d%B%Y"):
+        try:
+            return datetime.strptime(s.upper(), fmt).date()
+        except Exception:
+            pass
+    return None
+
 def _nearest_expiry(expiries):
     """Return the nearest future expiry date string from list."""
     today = date.today()
     future = []
     for e in expiries:
-        for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y"):
-            try:
-                d = datetime.strptime(e.upper(), fmt.upper()).date()
-                if d >= today:
-                    future.append((d, e))
-                break
-            except Exception:
-                pass
+        d = _parse_date(e)
+        if d is not None and d >= today:
+            future.append((d, e))
     if not future:
         return expiries[0] if expiries else None
     return sorted(future)[0][1]
@@ -107,15 +111,8 @@ def _get_option_tokens(instruments, symbol, expiry_str):
         # expiry check — instrument expiry in DDMMMYYYY
         inst_exp = inst.get("expiry", "").upper()
         # normalise both to YYYY-MM-DD for comparison
-        def to_date(s):
-            for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y"):
-                try:
-                    return datetime.strptime(s.upper(), fmt.upper()).date()
-                except Exception:
-                    pass
-            return None
-        inst_date = to_date(inst_exp)
-        tgt_date  = to_date(expiry_str)
+        inst_date = _parse_date(inst_exp)
+        tgt_date  = _parse_date(expiry_str)
         if inst_date != tgt_date:
             continue
         try:
@@ -142,14 +139,7 @@ def _get_all_expiries(instruments, symbol):
         e = inst.get("expiry", "")
         if e:
             expiries.add(e)
-    def to_date(s):
-        for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y"):
-            try:
-                return datetime.strptime(s.upper(), fmt.upper()).date()
-            except Exception:
-                pass
-        return date.max
-    return sorted(expiries, key=to_date)
+    return sorted(expiries, key=lambda s: _parse_date(s) or date.max)
 
 # ── Angel One session ─────────────────────────────────────────────────────────
 
@@ -190,7 +180,7 @@ def fetch_historical_candles(symbol, is_index=True, days=30):
     return get_historical_candles(smart, symbol, is_index, days)
 
 
-def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20):
+def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20, strike_range_pts=None):
     """
     Returns (df, meta) with same schema as nse_data.parse_option_chain.
     df columns: strike, ce_oi, ce_chg_oi, ce_volume, ce_iv, ce_ltp, ce_bid, ce_ask,
@@ -253,8 +243,11 @@ def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20):
     all_strikes = sorted(token_map.keys())
     atm_strike  = min(all_strikes, key=lambda s: abs(s - underlying))
     atm_idx     = all_strikes.index(atm_strike)
-    half        = num_strikes // 2
-    selected_strikes = all_strikes[max(0, atm_idx - half): atm_idx + half + 1]
+    if strike_range_pts and strike_range_pts > 0:
+        selected_strikes = [s for s in all_strikes if abs(s - atm_strike) <= strike_range_pts]
+    else:
+        half = num_strikes // 2
+        selected_strikes = all_strikes[max(0, atm_idx - half): atm_idx + half + 1]
 
     # 6. Fetch market data in batches of 50
     def _batched_market_data(tokens_exchange_pairs):
@@ -290,15 +283,7 @@ def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20):
     market_data = _batched_market_data(tokens_to_fetch)
 
     # 7. Calculate time to expiry
-    def _exp_to_date(s):
-        for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y", "%d %b %Y"):
-            try:
-                return datetime.strptime(s.upper(), fmt.upper()).date()
-            except Exception:
-                pass
-        return date.today() + timedelta(days=7)
-
-    exp_date = _exp_to_date(nearest_exp)
+    exp_date = _parse_date(nearest_exp) or (date.today() + timedelta(days=7))
     T = max(0.0, (exp_date - date.today()).days) / 365.0
 
     # 8. Build rows

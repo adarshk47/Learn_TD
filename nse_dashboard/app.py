@@ -53,7 +53,17 @@ with st.sidebar:
             symbol = search_query
         is_index = False
 
-    num_strikes  = st.slider("Strikes around ATM", 10, 40, 20, step=2)
+    strike_mode = st.radio("Strike Selection", ["By Count", "By Points Range"], horizontal=True)
+    if strike_mode == "By Count":
+        num_strikes     = st.slider("Strikes around ATM", 10, 80, 20, step=2)
+        strike_range_pts = None
+    else:
+        strike_range_pts = st.number_input(
+            "Range from ATM (±points)",
+            value=500, min_value=50, max_value=5000, step=50,
+            help="e.g. 500 → show all strikes within ±500 of ATM. NIFTY strikes are in steps of 50."
+        )
+        num_strikes = 80
     auto_refresh = st.checkbox("Auto Refresh", value=False)
     refresh_interval = st.selectbox(
         "Refresh every (sec)", [1, 5, 10, 30, 60, 120], index=3
@@ -114,9 +124,9 @@ def _get_nse_data(sym, idx, strikes):
     return df, meta
 
 @st.cache_data(ttl=60)
-def _get_angelone_data(sym, idx, strikes):
+def _get_angelone_data(sym, idx, strikes, range_pts=None):
     from angelone_data import fetch_option_chain_angelone
-    return fetch_option_chain_angelone(sym, idx, strikes)
+    return fetch_option_chain_angelone(sym, idx, strikes, range_pts)
 
 @st.cache_data(ttl=300)
 def _get_candles(sym, idx, days, src):
@@ -185,7 +195,7 @@ elif data_source == "NSE Direct":
 
 else:  # Angel One (Live)
     with st.spinner("Fetching {} via Angel One SmartAPI...".format(symbol)):
-        df, meta = _get_angelone_data(symbol, is_index, num_strikes)
+        df, meta = _get_angelone_data(symbol, is_index, num_strikes, strike_range_pts)
     if "error" in meta:
         st.error("Angel One fetch failed: " + meta["error"])
         st.warning(
