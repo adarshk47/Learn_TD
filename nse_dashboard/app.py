@@ -8,6 +8,7 @@ import numpy as np
 from datetime import datetime
 
 from nse_data import fetch_option_chain, parse_option_chain, generate_signal
+import smart_analysis as sa
 from demo_data import generate_demo_option_chain
 from stock_list import NSE_STOCKS, INDICES, FNO_INDICES, INDEX_YF_SYMBOLS, search_stocks
 import paper_trade as pt
@@ -150,7 +151,19 @@ def generate_trade_setups(oi_sig, tech_df, underlying, expiry, symbol):
 
     # ── DTE risk profile (SL%, Target%) ──────────────────────────────────────
     if dte == 0:
-        dte_note = "🔴 EXPIRY DAY — Avoid option buys (max theta risk)"
+        # Show actual market hours remaining (NSE: 09:15–15:30 = 375 min)
+        from datetime import time as _time
+        _now = datetime.now()
+        _close = _now.replace(hour=15, minute=30, second=0, microsecond=0)
+        _open  = _now.replace(hour=9,  minute=15, second=0, microsecond=0)
+        if _now.time() < _time(9, 15):
+            _hrs_left = 6.25
+        elif _now.time() > _time(15, 30):
+            _hrs_left = 0.0
+        else:
+            _hrs_left = round((_close - _now).total_seconds() / 3600, 1)
+        _time_txt = "{:.1f} hrs left ({})".format(_hrs_left, _now.strftime("%H:%M")) if _hrs_left > 0 else "Market closed"
+        dte_note = "⚡ EXPIRY DAY — {} | Max theta decay — scalp only, cut fast".format(_time_txt)
         dte_sl, dte_tgt = 15, 20
     elif dte == 1:
         dte_note = "⚠️ 1 DTE — Scalp only, very tight size"
@@ -913,6 +926,174 @@ with tab_live:
         )
 
     st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION E — LEGENDARY TRADER ANALYSIS
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 🧠 Smart Trade Intelligence")
+    st.caption("Analysis through Mark Douglas · Jesse Livermore · ICT · Van Tharp · Historical Expiry Learning")
+
+    with st.spinner("Running multi-framework analysis…"):
+        # Add proxy underlying to oi_sig for max-pain comparison
+        _sig_ext = {**sig, "underlying_proxy": underlying}
+        _daily_candles = _get_candles(symbol, is_index, 40, data_source)
+
+        _douglas  = sa.mark_douglas_score(_sig_ext, intra_tech, pcr, setups["15min"]["dte"] if setups else 7)
+        _livermore = sa.livermore_analysis(_daily_candles, underlying, symbol)
+        _ict      = sa.ict_analysis(df, underlying, _sig_ext)
+        _history  = sa.learn_from_expiry_history(_daily_candles)
+        _tharp    = sa.van_tharp_sizing(underlying,
+                                        float(df.iloc[(df["strike"]-underlying).abs().idxmin()]["ce_ltp"])
+                                        if not df.empty else underlying * 0.008,
+                                        setups["15min"]["dte"] if setups else 7,
+                                        symbol)
+        _conf, _direction, _reasoning = sa.master_confidence(_douglas, _livermore, _ict, _history)
+
+    # ── Master confidence card ────────────────────────────────────────────────
+    mc1, mc2, mc3 = st.columns([1, 1, 2])
+    _conf_col = "#4CAF50" if "CE" in _direction else "#ef5350" if "PE" in _direction else "#FF9800"
+    with mc1:
+        st.markdown(
+            '<div style="background:#0d1a0d;border:3px solid {c};padding:20px;'
+            'border-radius:14px;text-align:center;">'
+            '<div style="color:#aaa;font-size:12px;">MASTER CONFIDENCE</div>'
+            '<div style="font-size:48px;font-weight:bold;color:{c};">{p}%</div>'
+            '<div style="font-size:18px;font-weight:bold;color:{c};margin-top:4px;">{d}</div>'
+            '</div>'.format(c=_conf_col, p=_conf, d=_direction),
+            unsafe_allow_html=True,
+        )
+    with mc2:
+        st.markdown(
+            '<div style="background:#1e1e2e;padding:16px;border-radius:12px;height:100%;">'
+            '<div style="color:#aaa;font-size:12px;">MARK DOUGLAS VERDICT</div>'
+            '<div style="font-size:14px;color:#eee;margin:6px 0;">{}</div>'
+            '<div style="color:#aaa;font-size:11px;">{}/{} signals agree</div>'
+            '<div style="font-size:12px;color:#ccc;margin-top:8px;">{}</div>'
+            '</div>'.format(
+                _douglas["verdict"],
+                max(_douglas["bull"], _douglas["bear"]), _douglas["total"],
+                _douglas["advice"]
+            ),
+            unsafe_allow_html=True,
+        )
+    with mc3:
+        st.markdown("**Multi-framework reasoning:**")
+        for line in _reasoning:
+            st.markdown("• " + line)
+
+    st.divider()
+
+    # ── Expandable framework details ──────────────────────────────────────────
+    fa1, fa2 = st.columns(2)
+
+    with fa1:
+        with st.expander("📖 Jesse Livermore — Trend & Stage Analysis", expanded=False):
+            lv = _livermore
+            trend_col = "#4CAF50" if lv["trend"] == "UPTREND" else "#ef5350" if lv["trend"] == "DOWNTREND" else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
+                '<b style="color:{c};">{t}</b><br>'
+                '<span style="color:#ccc;font-size:13px;">{s}</span><br><br>'
+                '<span style="color:#aaa;font-size:12px;">5-day momentum: {:+.2f}%'
+                ' | EMA-slow: ₹{:.1f} | Range(20d): ₹{:.0f}</span><br>'
+                '<i style="color:#ddd;font-size:12px;">{tape}</i>'
+                '</div>'.format(
+                    lv["mom5_pct"], lv["ema_slow"], lv["range20"],
+                    c=trend_col, t=lv["trend"], s=lv["stage"], tape=lv["tape"]
+                ),
+                unsafe_allow_html=True,
+            )
+            if lv["pivot_hi"]:
+                st.markdown("**Resistance pivots:** " + ", ".join("₹{:,.0f}".format(p) for p in lv["pivot_hi"]))
+            if lv["pivot_lo"]:
+                st.markdown("**Support pivots:** " + ", ".join("₹{:,.0f}".format(p) for p in lv["pivot_lo"]))
+
+        with st.expander("🏦 ICT / Smart Money — Institutional Footprints", expanded=False):
+            ic = _ict
+            st.markdown(ic.get("narrative", ""))
+            ic_df = pd.DataFrame({
+                "Level":    ["CE Wall (Resistance)", "PE Wall (Support)", "Max Pain Magnet"],
+                "Strike":   [ic.get("ce_wall", 0), ic.get("pe_wall", 0), ic.get("max_pain", 0)],
+                "Distance": ["₹{:+.0f}".format(ic.get("dist_ce", 0)),
+                             "₹{:+.0f}".format(-ic.get("dist_pe", 0)),
+                             "₹{:+.0f}".format(ic.get("dist_mp", 0))],
+            })
+            st.dataframe(ic_df, hide_index=True, use_container_width=True)
+            st.markdown("**Top CE OI strikes (resistance pool):**")
+            for row in ic.get("top3_ce", []):
+                st.markdown("  ₹{strike:.0f} — {ce_oi:,.0f} contracts".format(**row))
+
+    with fa2:
+        with st.expander("💰 Van Tharp — R-Multiple & Position Sizing", expanded=False):
+            vt = _tharp
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
+                '<b style="color:#FFD700;">1R Risk Model  (1.5% of ₹{:,.0f} capital)</b><br><br>'
+                '<table style="width:100%;color:#ccc;font-size:13px;">'
+                '<tr><td>ATM Premium</td><td><b>₹{}</b></td></tr>'
+                '<tr><td>Stop-Loss ({}%)</td><td style="color:#ef5350;"><b>₹{}</b></td></tr>'
+                '<tr><td>Target (2R)</td><td style="color:#26a69a;"><b>₹{}</b></td></tr>'
+                '<tr><td>Lot Size</td><td><b>{} units</b></td></tr>'
+                '<tr><td>Cost per Lot</td><td><b>₹{:,}</b></td></tr>'
+                '<tr><td>Max Lots (1R = 1.5%)</td><td style="color:#FFD700;"><b>{}</b></td></tr>'
+                '<tr><td>Risk per Lot</td><td><b>₹{:,}</b></td></tr>'
+                '<tr><td>System Expectancy</td><td><b>{:.2f}R</b></td></tr>'
+                '</table></div>'.format(
+                    vt["capital"], vt["premium_est"], int(vt["sl_pct"]),
+                    vt["sl_price"], vt["target_2r"], vt["lot_size"],
+                    int(vt["cost_1lot"]), vt["max_lots"],
+                    int(vt["risk_per_lot"]), vt["expectancy_r"]
+                ),
+                unsafe_allow_html=True,
+            )
+            st.caption("Van Tharp: Size so that 1 stop-out = 1.5% capital loss. Never risk more than 2%.")
+
+        with st.expander("📚 Historical Expiry Learning — What the Past Says", expanded=False):
+            hist = _history
+            st.markdown("**Pattern summary:**")
+            st.info(hist.get("summary", "No data."))
+
+            bias_col = "#4CAF50" if "BULLISH" in hist.get("pattern_bias", "") else \
+                       "#ef5350" if "BEARISH" in hist.get("pattern_bias", "") else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;'
+                'border-left:4px solid {};">'
+                '<b style="color:{};">Today matches: {}</b>'
+                '</div>'.format(bias_col, bias_col, hist.get("pattern_bias", "")),
+                unsafe_allow_html=True,
+            )
+            if hist.get("lesson"):
+                st.markdown("**💡 Lesson from last session:**")
+                st.success(hist["lesson"])
+
+            if hist.get("patterns"):
+                hdf = pd.DataFrame(hist["patterns"])[[
+                    "date", "weekday", "rsi", "ema_trend", "range_pct", "close_chg", "outcome"
+                ]]
+                hdf.columns = ["Date", "Day", "RSI", "EMA", "Range%", "Chg%", "Outcome"]
+
+                def _oc2(val):
+                    return "color:#4CAF50" if val == "BULLISH" else \
+                           "color:#ef5350" if val == "BEARISH" else "color:#FF9800"
+
+                st.dataframe(
+                    hdf.style.map(_oc2, subset=["Outcome"]),
+                    hide_index=True, use_container_width=True
+                )
+
+    # ── Mark Douglas confluence grid ──────────────────────────────────────────
+    with st.expander("📊 Mark Douglas — Full Confluence Grid", expanded=False):
+        chk_df = pd.DataFrame(_douglas["checks"], columns=["Indicator", "Signal"])
+        chk_df["Signal"] = chk_df["Signal"].map({1: "✅ BULL", -1: "❌ BEAR", 0: "⚪ NEUTRAL"})
+        st.dataframe(chk_df, hide_index=True, use_container_width=True)
+        st.markdown(
+            "**{} Bull | {} Bear | {} Neutral** out of {} checks — **{}**".format(
+                _douglas["bull"], _douglas["bear"], _douglas["neutral"],
+                _douglas["total"], _douglas["verdict"]
+            )
+        )
+
+    st.divider()
     st.markdown("### Tomorrow's Prediction")
 
     atm_iv = float(df.iloc[(df["strike"] - underlying).abs().idxmin()]["ce_iv"])
@@ -1176,7 +1357,7 @@ with tab_bt:
                     return "color: #FF9800"
 
                 st.dataframe(
-                    fdf.style.applymap(_oc, subset=["outcome"]),
+                    fdf.style.map(_oc, subset=["outcome"]),
                     use_container_width=True, height=350
                 )
             else:
@@ -1367,7 +1548,7 @@ with tab_pt:
             return "color: #888"
 
         st.dataframe(
-            closed_df.style.applymap(_pnl_color, subset=["P&L ₹"]),
+            closed_df.style.map(_pnl_color, subset=["P&L ₹"]),
             use_container_width=True, hide_index=True
         )
 
@@ -1733,8 +1914,8 @@ with tab_idx:
 
                 st.dataframe(
                     ov_df.style
-                        .applymap(_sig_color, subset=["Signal"])
-                        .applymap(_chg_color, subset=["Chg %"])
+                        .map(_sig_color, subset=["Signal"])
+                        .map(_chg_color, subset=["Chg %"])
                         .format({"Spot ₹": "{:,.2f}", "EMA9": "{:,.2f}",
                                  "EMA20": "{:,.2f}", "VWAP": "{:,.2f}",
                                  "RSI": "{:.1f}", "Chg %": "{:+.2f}%"}),
