@@ -1,4 +1,4 @@
-import os
+﻿import os
 import math
 import time
 import streamlit as st
@@ -8,314 +8,28 @@ import numpy as np
 from datetime import datetime
 
 from nse_data import fetch_option_chain, parse_option_chain, generate_signal
-import smart_analysis as sa
 from demo_data import generate_demo_option_chain
-from stock_list import NSE_STOCKS, INDICES, FNO_INDICES, INDEX_YF_SYMBOLS, search_stocks
+from stock_list import NSE_STOCKS, INDICES, INDEX_YF_SYMBOLS, search_stocks
 import paper_trade as pt
 import chat_bot
 import backtest
 import model_train
+import scanner as sc
+import expiry_analysis as ea
+import smart_analysis as sa
 
-# ── Technical indicator helpers ───────────────────────────────────────────────
-
-def compute_technicals(df):
-    """
-    Compute VWAP, EMA-9, EMA-20, RSI-14, PVT and Net Volume from an OHLCV
-    DataFrame with columns: datetime, open, high, low, close, volume.
-    Returns a copy with new columns added.
-    """
-    d = df.copy().reset_index(drop=True)
-    # VWAP (cumulative session-style over the full window)
-    hlc3          = (d["high"] + d["low"] + d["close"]) / 3
-    cum_vol       = d["volume"].cumsum().replace(0, np.nan)
-    d["vwap"]     = (hlc3 * d["volume"]).cumsum() / cum_vol
-    # EMA 9 & 20
-    d["ema9"]     = d["close"].ewm(span=9,  adjust=False).mean()
-    d["ema20"]    = d["close"].ewm(span=20, adjust=False).mean()
-    # RSI 14
-    delta         = d["close"].diff()
-    gain          = delta.clip(lower=0)
-    loss          = (-delta).clip(lower=0)
-    avg_gain      = gain.ewm(com=13, min_periods=1).mean()
-    avg_loss      = loss.ewm(com=13, min_periods=1).mean()
-    d["rsi"]      = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-9))
-    # MACD (12, 26, 9)
-    ema12          = d["close"].ewm(span=12, adjust=False).mean()
-    ema26          = d["close"].ewm(span=26, adjust=False).mean()
-    d["macd"]      = ema12 - ema26
-    d["macd_sig"]  = d["macd"].ewm(span=9, adjust=False).mean()
-    d["macd_hist"] = d["macd"] - d["macd_sig"]
-    # PVT (Price Volume Trend)
-    pct_chg       = d["close"].pct_change().fillna(0)
-    d["pvt"]      = (pct_chg * d["volume"]).cumsum()
-    # Net Volume (positive when close rises, negative when it falls)
-    direction     = np.sign(d["close"].diff().fillna(0))
-    d["net_vol"]  = d["volume"] * direction
-    return d
-
-
-def tech_signal(d):
-    """
-    Derive a BULLISH / BEARISH / NEUTRAL signal from computed_technicals output.
-    Returns (signal_str, color_str, score_int, reasons_list).
-    """
-    if len(d) < 5:
-        return "WAIT", "orange", 0, ["Not enough data"]
-    r    = d.iloc[-1]
-    score   = 0
-    reasons = []
-    # 1. Price vs VWAP
-    if r["close"] > r["vwap"]:
-        score += 1
-        reasons.append("✅ Price {:.1f} > VWAP {:.1f} → Bullish".format(r["close"], r["vwap"]))
-    else:
-        score -= 1
-        reasons.append("❌ Price {:.1f} < VWAP {:.1f} → Bearish".format(r["close"], r["vwap"]))
-    # 2. EMA crossover
-    if r["ema9"] > r["ema20"]:
-        score += 1
-        reasons.append("✅ EMA9 {:.1f} > EMA20 {:.1f} → Bullish crossover".format(r["ema9"], r["ema20"]))
-    else:
-        score -= 1
-        reasons.append("❌ EMA9 {:.1f} < EMA20 {:.1f} → Bearish crossover".format(r["ema9"], r["ema20"]))
-    # 3. RSI
-    rsi_val = float(r["rsi"])
-    if rsi_val > 60:
-        score += 1
-        reasons.append("✅ RSI {:.1f} → Bullish momentum".format(rsi_val))
-    elif rsi_val < 40:
-        score -= 1
-        reasons.append("❌ RSI {:.1f} → Bearish pressure".format(rsi_val))
-    else:
-        reasons.append("⚠️ RSI {:.1f} → Neutral zone (40–60)".format(rsi_val))
-    # 4. PVT trend (3-bar slope)
-    if len(d) >= 4:
-        pvt_slope = float(d["pvt"].iloc[-1] - d["pvt"].iloc[-4])
-        if pvt_slope > 0:
-            score += 1
-            reasons.append("✅ PVT rising → Volume supporting bulls")
-        else:
-            score -= 1
-            reasons.append("❌ PVT falling → Volume supporting bears")
-    # 5. Net Volume (last 3 bars)
-    if len(d) >= 3:
-        net_sum = float(d["net_vol"].iloc[-3:].sum())
-        if net_sum > 0:
-            score += 1
-            reasons.append("✅ Net volume positive → Buying pressure")
-        else:
-            score -= 1
-            reasons.append("❌ Net volume negative → Selling pressure")
-    if score >= 3:
-        return "STRONG BULLISH", "green", score, reasons
-    elif score >= 1:
-        return "BULLISH", "#8BC34A", score, reasons
-    elif score <= -3:
-        return "STRONG BEARISH", "red", score, reasons
-    elif score <= -1:
-        return "BEARISH", "#ef5350", score, reasons
-    return "NEUTRAL", "orange", score, reasons
-
-
-_STRIKE_STEP = {
-    "NIFTY": 50, "BANKNIFTY": 100, "FINNIFTY": 50,
-    "MIDCPNIFTY": 25, "SENSEX": 100,
-}
-
-def _parse_expiry_date(expiry_str):
-    """Return a date object from any common expiry string, or None."""
-    from datetime import date as _date
-    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d %b %Y", "%d-%B-%Y", "%d%b%Y"):
-        try:
-            return datetime.strptime(expiry_str.upper(), fmt.upper()).date()
-        except Exception:
-            pass
-    return None
-
-
-def generate_trade_setups(oi_sig, tech_df, underlying, expiry, symbol):
-    """
-    Combine OI signal + MACD + RSI + EMA + VWAP + PVT into per-timeframe
-    trade setup cards: 10min / 15min / 30min / 1hr.
-
-    Returns dict  tf → {direction, confidence, strike, premium_est,
-                         sl_pct, tgt_pct, dte, dte_note, score, bullets}
-    """
-    from datetime import date as _date
-    TIMEFRAMES = ["10min", "15min", "30min", "1hr"]
-
-    # ── DTE calculation ───────────────────────────────────────────────────────
-    exp_date = _parse_expiry_date(expiry)
-    dte = int((exp_date - _date.today()).days) if exp_date else 7
-    dte = max(0, dte)
-
-    # ── DTE risk profile (SL%, Target%) ──────────────────────────────────────
-    if dte == 0:
-        # Show actual market hours remaining (NSE: 09:15–15:30 = 375 min)
-        from datetime import time as _time
-        _now = datetime.now()
-        _close = _now.replace(hour=15, minute=30, second=0, microsecond=0)
-        _open  = _now.replace(hour=9,  minute=15, second=0, microsecond=0)
-        if _now.time() < _time(9, 15):
-            _hrs_left = 6.25
-        elif _now.time() > _time(15, 30):
-            _hrs_left = 0.0
-        else:
-            _hrs_left = round((_close - _now).total_seconds() / 3600, 1)
-        _time_txt = "{:.1f} hrs left ({})".format(_hrs_left, _now.strftime("%H:%M")) if _hrs_left > 0 else "Market closed"
-        dte_note = "⚡ EXPIRY DAY — {} | Max theta decay — scalp only, cut fast".format(_time_txt)
-        dte_sl, dte_tgt = 15, 20
-    elif dte == 1:
-        dte_note = "⚠️ 1 DTE — Scalp only, very tight size"
-        dte_sl, dte_tgt = 20, 30
-    elif dte <= 3:
-        dte_note = "⏳ {} DTE — Short-expiry scalp, ATM preferred".format(dte)
-        dte_sl, dte_tgt = 30, 50
-    elif dte <= 7:
-        dte_note = "📅 {} DTE — Weekly expiry window, intraday/swing OK".format(dte)
-        dte_sl, dte_tgt = 35, 65
-    else:
-        dte_note = "📆 {} DTE — Positional friendly, spreads recommended".format(dte)
-        dte_sl, dte_tgt = 40, 80
-
-    # ── Technical composite score (from intraday candles) ────────────────────
-    ts      = 0
-    bullets = []
-
-    if tech_df is not None and not tech_df.empty and len(tech_df) >= 5:
-        r    = tech_df.iloc[-1]
-        prev = tech_df.iloc[-2]
-
-        # 1. MACD
-        macd_val  = float(r.get("macd",     r.get("macd",     0)))
-        macd_sig  = float(r.get("macd_sig", r.get("macd_signal", 0)))
-        macd_hist = float(r.get("macd_hist", 0))
-        if macd_val > macd_sig:
-            ts += 2
-            strength = "rising ↑" if macd_hist > float(prev.get("macd_hist", 0)) else "above signal"
-            bullets.append("✅ MACD {} → Bullish".format(strength))
-        else:
-            ts -= 2
-            bullets.append("❌ MACD below signal → Bearish")
-
-        # 2. RSI
-        rsi_v = float(r.get("rsi", r.get("rsi14", 50)))
-        if rsi_v > 65:
-            ts += 2; bullets.append("✅ RSI {:.0f} → Strong bullish momentum".format(rsi_v))
-        elif rsi_v > 55:
-            ts += 1; bullets.append("✅ RSI {:.0f} → Mild bullish".format(rsi_v))
-        elif rsi_v < 35:
-            ts -= 2; bullets.append("❌ RSI {:.0f} → Strong bearish pressure".format(rsi_v))
-        elif rsi_v < 45:
-            ts -= 1; bullets.append("❌ RSI {:.0f} → Mild bearish".format(rsi_v))
-        else:
-            bullets.append("⚪ RSI {:.0f} → Neutral".format(rsi_v))
-
-        # 3. EMA crossover
-        e9, e20 = float(r.get("ema9", 0)), float(r.get("ema20", r.get("ema21", 0)))
-        if e9 > e20:
-            ts += 1; bullets.append("✅ EMA9 > EMA20 → Uptrend")
-        else:
-            ts -= 1; bullets.append("❌ EMA9 < EMA20 → Downtrend")
-
-        # 4. Price vs VWAP
-        close_v, vwap_v = float(r.get("close", 0)), float(r.get("vwap", 0))
-        if vwap_v > 0:
-            if close_v > vwap_v:
-                ts += 1; bullets.append("✅ Price above VWAP → Intraday bullish")
-            else:
-                ts -= 1; bullets.append("❌ Price below VWAP → Intraday bearish")
-
-        # 5. PVT slope (3-bar)
-        if "pvt" in tech_df.columns and len(tech_df) >= 4:
-            pvt_slope = float(tech_df["pvt"].iloc[-1] - tech_df["pvt"].iloc[-4])
-            if pvt_slope > 0:
-                ts += 1; bullets.append("✅ PVT rising → Volume confirming bulls")
-            else:
-                ts -= 1; bullets.append("❌ PVT falling → Volume confirming bears")
-
-    else:
-        bullets.append("⚠️ Intraday candles unavailable — using OI signal only")
-
-    # ── OI signal score (normalised to ±5) ───────────────────────────────────
-    oi_raw   = oi_sig.get("score", 0)
-    oi_norm  = max(-5, min(5, round(oi_raw / 20)))
-    oi_dir   = oi_sig.get("signal", "AVOID / WAIT")
-    oi_pcr   = oi_sig.get("pcr", 1.0)
-    bullets.append("📊 OI score {:+d} (PCR={}, Signal: {})".format(oi_norm, oi_pcr, oi_dir))
-
-    combined = ts + oi_norm  # range: about -12 to +12
-
-    # ── Direction ─────────────────────────────────────────────────────────────
-    if combined >= 3:
-        direction, dir_col = "BUY CE 🟢", "green"
-    elif combined <= -3:
-        direction, dir_col = "BUY PE 🔴", "red"
-    elif combined >= 1:
-        direction, dir_col = "MILD BULLISH ↑", "#8BC34A"
-    elif combined <= -1:
-        direction, dir_col = "MILD BEARISH ↓", "#ef5350"
-    else:
-        direction, dir_col = "WAIT / NEUTRAL ⚪", "orange"
-
-    # ── Strike selection ──────────────────────────────────────────────────────
-    step = _STRIKE_STEP.get(symbol.upper(), 50)
-    atm  = round(underlying / step) * step
-    if abs(combined) >= 6:
-        rec_strike = atm                     # ATM — max gamma
-    elif abs(combined) >= 3:
-        rec_strike = (atm + step) if combined > 0 else (atm - step)  # 1 OTM
-    else:
-        rec_strike = atm
-
-    premium_est = round(underlying * 0.008, 0)   # ~0.8% ATM premium estimate
-    confidence  = min(92, max(10, 50 + combined * 6))
-
-    # ── Per-timeframe SL/Target multipliers ──────────────────────────────────
-    tf_mults = {
-        "10min": (0.50, 0.45, "Scalp   ~10 min"),
-        "15min": (0.65, 0.60, "Scalp   ~15 min"),
-        "30min": (0.80, 0.75, "Intraday 30 min"),
-        "1hr":   (1.00, 1.00, "Intraday  1 hr "),
-    }
-
-    setups = {}
-    for tf in TIMEFRAMES:
-        sl_m, tgt_m, tf_label = tf_mults[tf]
-        sl_pct  = round(dte_sl  * sl_m,  1)
-        tgt_pct = round(dte_tgt * tgt_m, 1)
-        setups[tf] = {
-            "label":        tf_label,
-            "direction":    direction,
-            "dir_col":      dir_col,
-            "confidence":   confidence,
-            "combined":     combined,
-            "tech_score":   ts,
-            "oi_score":     oi_norm,
-            "atm":          atm,
-            "rec_strike":   rec_strike,
-            "premium_est":  premium_est,
-            "sl_pct":       sl_pct,
-            "tgt_pct":      tgt_pct,
-            "dte":          dte,
-            "dte_note":     dte_note,
-            "bullets":      bullets,
-        }
-    return setups
-
-
-APP_VERSION = "v2.4"
+APP_VERSION = "v2.3"
 
 st.set_page_config(
     page_title="NSE Options Intelligence {}".format(APP_VERSION),
-    page_icon="📈",
+    page_icon="ðŸ“ˆ",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 st.markdown("<style>.stMetric > div { font-size: 18px; }</style>", unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# â”€â”€ Sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 with st.sidebar:
     st.title("NSE Options Intelligence")
     st.divider()
@@ -323,12 +37,9 @@ with st.sidebar:
     instrument_type = st.radio("Instrument Type", ["Index", "Stock"])
 
     if instrument_type == "Index":
-        # Only F&O indices have an option chain — others are analysis-only
-        fno_indices   = {k: v for k, v in INDICES.items() if k in FNO_INDICES}
-        index_options = ["{} — {}".format(k, v) for k, v in fno_indices.items()]
-        selected_idx  = st.selectbox("Select Index", index_options,
-                                     help="For all indices go to 🇮🇳 Index Analysis tab")
-        symbol        = selected_idx.split(" — ")[0]
+        index_options = ["{} â€” {}".format(k, v) for k, v in INDICES.items()]
+        selected_idx  = st.selectbox("Select Index", index_options)
+        symbol        = selected_idx.split(" â€” ")[0]
         is_index      = True
     else:
         search_query = st.text_input(
@@ -337,25 +48,15 @@ with st.sidebar:
         ).upper().strip()
         suggestions = search_stocks(search_query)
         if suggestions:
-            opts     = ["{} — {}".format(s, n) for s, n in suggestions]
+            opts     = ["{} â€” {}".format(s, n) for s, n in suggestions]
             selected = st.selectbox("Matches", opts, index=0)
-            symbol   = selected.split(" — ")[0]
+            symbol   = selected.split(" â€” ")[0]
         else:
             st.warning("No match. Using: " + search_query)
             symbol = search_query
         is_index = False
 
-    strike_mode = st.radio("Strike Selection", ["By Count", "By Points Range"], horizontal=True)
-    if strike_mode == "By Count":
-        num_strikes     = st.slider("Strikes around ATM", 10, 80, 20, step=2)
-        strike_range_pts = None
-    else:
-        strike_range_pts = st.number_input(
-            "Range from ATM (±points)",
-            value=500, min_value=50, max_value=5000, step=50,
-            help="e.g. 500 → show all strikes within ±500 of ATM. NIFTY strikes are in steps of 50."
-        )
-        num_strikes = 80
+    num_strikes  = st.slider("Strikes around ATM", 10, 40, 20, step=2)
     auto_refresh = st.checkbox("Auto Refresh", value=False)
     refresh_interval = st.selectbox(
         "Refresh every (sec)", [1, 5, 10, 30, 60, 120], index=3
@@ -388,13 +89,13 @@ with st.sidebar:
 
     st.caption("Updated: {}  |  {}".format(datetime.now().strftime("%H:%M:%S"), APP_VERSION))
 
-# ── Test NSE connection ───────────────────────────────────────────────────────
+# â”€â”€ Test NSE connection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if test_mode:
     with st.spinner("Testing NSE connection for {} ...".format(symbol)):
         raw = fetch_option_chain(symbol, is_index)
     if "error" in raw:
         st.error("NSE connection FAILED: " + raw["error"])
-        st.info("Try during market hours (9:15 AM – 3:30 PM IST) on Indian internet.")
+        st.info("Try during market hours (9:15 AM â€“ 3:30 PM IST) on Indian internet.")
     elif not raw:
         st.error("NSE returned empty response.")
     else:
@@ -407,7 +108,7 @@ if test_mode:
             st.write("record count:", len(rec.get("data", [])))
     st.stop()
 
-# ── Cached data fetchers (module-level for st.cache_data) ─────────────────────
+# â”€â”€ Cached data fetchers (module-level for st.cache_data) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @st.cache_data(ttl=60)
 def _get_nse_data(sym, idx, strikes):
@@ -416,13 +117,13 @@ def _get_nse_data(sym, idx, strikes):
     return df, meta
 
 @st.cache_data(ttl=60)
-def _get_angelone_data(sym, idx, strikes, range_pts=None):
+def _get_angelone_data(sym, idx, strikes):
     from angelone_data import fetch_option_chain_angelone
-    return fetch_option_chain_angelone(sym, idx, strikes, range_pts)
+    return fetch_option_chain_angelone(sym, idx, strikes)
 
 @st.cache_data(ttl=300)
 def _get_candles(sym, idx, days, src):
-    # 1. Angel One live historical candles
+    # 1. Angel One live
     if src == "Angel One (Live)":
         try:
             from angelone_data import fetch_historical_candles
@@ -431,27 +132,26 @@ def _get_candles(sym, idx, days, src):
                 return c
         except Exception:
             pass
-    # 2. yfinance fallback (works for all NSE/BSE indices without auth)
+    # 2. yfinance fallback (works for all NSE/BSE indices)
     yf_sym = INDEX_YF_SYMBOLS.get(sym.upper())
     if yf_sym:
         try:
             import yfinance as yf
-            tk   = yf.Ticker(yf_sym)
-            hist = tk.history(period="{}d".format(days + 15))
+            hist = yf.Ticker(yf_sym).history(period="{}d".format(days + 15))
             if not hist.empty:
                 hist = hist.reset_index()
-                date_col = "Date" if "Date" in hist.columns else "Datetime"
+                dc   = "Date" if "Date" in hist.columns else "Datetime"
                 return pd.DataFrame({
-                    "datetime": pd.to_datetime(hist[date_col]).dt.tz_localize(None),
-                    "open":     hist["Open"].astype(float),
-                    "high":     hist["High"].astype(float),
-                    "low":      hist["Low"].astype(float),
-                    "close":    hist["Close"].astype(float),
-                    "volume":   hist["Volume"].astype(float),
+                    "datetime": pd.to_datetime(hist[dc]).dt.tz_localize(None),
+                    "open":  hist["Open"].astype(float),
+                    "high":  hist["High"].astype(float),
+                    "low":   hist["Low"].astype(float),
+                    "close": hist["Close"].astype(float),
+                    "volume":hist["Volume"].astype(float),
                 }).tail(days).reset_index(drop=True)
         except Exception:
             pass
-    # 3. Synthetic demo fallback
+    # 3. Synthetic fallback
     from demo_data import generate_demo_option_chain
     _, dm  = generate_demo_option_chain(sym if idx else "NIFTY")
     base   = dm["underlying"]
@@ -468,14 +168,10 @@ def _get_candles(sym, idx, days, src):
         "volume":   np.random.randint(100000, 500000, days).astype(float),
     })
 
+
 @st.cache_data(ttl=60)
-def _get_intraday_candles_cached(sym, tf, src):
-    """
-    Fetch intraday OHLCV for the live-dashboard trade-setup panel.
-    Tries Angel One first, then yfinance intraday, then returns empty.
-    tf: '5min' | '10min' | '15min' | '30min' | '1hr'
-    """
-    # 1. Angel One
+def _get_intraday(sym, tf, src):
+    """Fetch intraday candles: Angel One → yfinance → empty."""
     if src == "Angel One (Live)":
         try:
             from angelone_data import fetch_intraday_candles
@@ -484,41 +180,59 @@ def _get_intraday_candles_cached(sym, tf, src):
                 return c
         except Exception:
             pass
-    # 2. yfinance intraday
     yf_sym = INDEX_YF_SYMBOLS.get(sym.upper())
     if yf_sym:
         try:
             import yfinance as yf
-            yf_interval = {"5min": "5m", "10min": "10m", "15min": "15m",
-                           "30min": "30m", "1hr": "60m"}.get(tf, "15m")
-            yf_period   = {"5min": "1d", "10min": "2d", "15min": "5d",
-                           "30min": "10d", "1hr": "20d"}.get(tf, "5d")
-            tk   = yf.Ticker(yf_sym)
-            hist = tk.history(period=yf_period, interval=yf_interval)
+            yf_iv = {"5min":"5m","10min":"10m","15min":"15m","30min":"30m","1hr":"60m"}.get(tf,"15m")
+            yf_pd = {"5min":"1d","10min":"2d","15min":"5d","30min":"10d","1hr":"20d"}.get(tf,"5d")
+            hist  = yf.Ticker(yf_sym).history(period=yf_pd, interval=yf_iv)
             if not hist.empty:
                 hist = hist.reset_index()
                 dc   = "Datetime" if "Datetime" in hist.columns else "Date"
                 return pd.DataFrame({
                     "datetime": pd.to_datetime(hist[dc]).dt.tz_localize(None),
-                    "open":    hist["Open"].astype(float),
-                    "high":    hist["High"].astype(float),
-                    "low":     hist["Low"].astype(float),
-                    "close":   hist["Close"].astype(float),
-                    "volume":  hist["Volume"].astype(float),
+                    "open":  hist["Open"].astype(float),
+                    "high":  hist["High"].astype(float),
+                    "low":   hist["Low"].astype(float),
+                    "close": hist["Close"].astype(float),
+                    "volume":hist["Volume"].astype(float),
                 }).dropna(subset=["close"]).reset_index(drop=True)
         except Exception:
             pass
     return pd.DataFrame()
 
 
-# ── Data fetch ────────────────────────────────────────────────────────────────
+def _compute_tech(df):
+    """VWAP, EMA9/20, MACD, RSI14, PVT, Net Volume from OHLCV DataFrame."""
+    d = df.copy().reset_index(drop=True)
+    hlc3        = (d["high"] + d["low"] + d["close"]) / 3
+    cum_vol     = d["volume"].cumsum().replace(0, np.nan)
+    d["vwap"]   = (hlc3 * d["volume"]).cumsum() / cum_vol
+    d["ema9"]   = d["close"].ewm(span=9,  adjust=False).mean()
+    d["ema20"]  = d["close"].ewm(span=20, adjust=False).mean()
+    ema12       = d["close"].ewm(span=12, adjust=False).mean()
+    ema26       = d["close"].ewm(span=26, adjust=False).mean()
+    d["macd"]      = ema12 - ema26
+    d["macd_sig"]  = d["macd"].ewm(span=9, adjust=False).mean()
+    d["macd_hist"] = d["macd"] - d["macd_sig"]
+    delta       = d["close"].diff()
+    ag          = delta.clip(lower=0).ewm(com=13, min_periods=1).mean()
+    al          = (-delta).clip(lower=0).ewm(com=13, min_periods=1).mean()
+    d["rsi"]    = 100 - 100 / (1 + ag / (al + 1e-9))
+    pct         = d["close"].pct_change().fillna(0)
+    d["pvt"]    = (pct * d["volume"]).cumsum()
+    d["net_vol"]= d["volume"] * np.sign(d["close"].diff().fillna(0))
+    return d
+
+# â”€â”€ Data fetch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 df   = pd.DataFrame()
 meta = {}
 
 if data_source == "Demo Mode":
     df, meta = generate_demo_option_chain(symbol if is_index else "NIFTY")
-    st.info("Demo Mode ON — simulated data. Switch Data Source for live data.")
+    st.info("Demo Mode ON â€” simulated data. Switch Data Source for live data.")
 
 elif data_source == "NSE CSV Upload":
     if csv_file is None:
@@ -552,7 +266,7 @@ elif data_source == "NSE Direct":
 
 else:  # Angel One (Live)
     with st.spinner("Fetching {} via Angel One SmartAPI...".format(symbol)):
-        df, meta = _get_angelone_data(symbol, is_index, num_strikes, strike_range_pts)
+        df, meta = _get_angelone_data(symbol, is_index, num_strikes)
     if "error" in meta:
         st.error("Angel One fetch failed: " + meta["error"])
         st.warning(
@@ -568,7 +282,7 @@ if df.empty:
     st.warning("No option chain data. Enable Demo Mode to preview.")
     st.stop()
 
-# ── Shared signal computation ─────────────────────────────────────────────────
+# â”€â”€ Shared signal computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 sig        = generate_signal(df, meta)
 underlying = meta["underlying"]
 expiry     = meta["expiry"]
@@ -577,295 +291,268 @@ max_pain   = sig["max_pain"]
 source_tag = meta.get("source", data_source)
 meta["symbol"] = symbol
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_live, tab_bt, tab_pt, tab_chat, tab_idx = st.tabs(
-    ["📊 Live Dashboard", "📈 Backtest", "💼 Paper Trade", "💬 Chat", "🇮🇳 Index Analysis"]
+# â”€â”€ Tabs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+tab_live, tab_scan, tab_exp, tab_bt, tab_pt, tab_chat = st.tabs(
+    ["ðŸ“Š Live Dashboard", "ðŸ” Market Scanner", "ðŸ“… Expiry Signals",
+     "ðŸ“ˆ Backtest", "ðŸ’¼ Paper Trade", "ðŸ’¬ Chat"]
 )
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 1 — LIVE DASHBOARD
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 1 â€” LIVE DASHBOARD
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_live:
-    # ── Header ────────────────────────────────────────────────────────────────
-    st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
-    st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`  |  `{}`".format(
-        underlying, meta["atm"], source_tag, datetime.now().strftime("%H:%M:%S")))
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION A — MULTI-TIMEFRAME TRADE SETUP
-    # ═══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 🎯 Live Trade Setup")
-
-    # Fetch 15-min intraday candles for technical analysis
-    with st.spinner("Loading intraday technicals…"):
-        intra_raw   = _get_intraday_candles_cached(symbol, "15min", data_source)
-        intra_tech  = compute_technicals(intra_raw) if not intra_raw.empty else pd.DataFrame()
-
-    setups = generate_trade_setups(sig, intra_tech, underlying, expiry, symbol)
-
-    if setups:
-        # DTE warning banner
-        dte_val  = list(setups.values())[0]["dte"]
-        dte_note = list(setups.values())[0]["dte_note"]
-        if dte_val <= 1:
-            st.error(dte_note)
-        elif dte_val <= 3:
-            st.warning(dte_note)
-        else:
-            st.info(dte_note)
-
-        # 4 timeframe cards
-        tf_cols = st.columns(4)
-        tf_order = ["10min", "15min", "30min", "1hr"]
-        for col, tf in zip(tf_cols, tf_order):
-            s = setups[tf]
-            bg_c  = {"green": "#0d2e0d", "red": "#2e0d0d",
-                     "#8BC34A": "#1a2e0d", "#ef5350": "#2e1010", "orange": "#2e2200"}
-            brd_c = {"green": "#4CAF50", "red": "#f44336",
-                     "#8BC34A": "#8BC34A", "#ef5350": "#ef5350", "orange": "#FF9800"}
-            bg  = bg_c.get(s["dir_col"],  "#1e1e2e")
-            brd = brd_c.get(s["dir_col"], "#888")
-            col.markdown(
-                '<div style="background:{bg};border:2px solid {brd};padding:14px;'
-                'border-radius:12px;text-align:center;margin-bottom:4px;">'
-                '<div style="color:#aaa;font-size:11px;letter-spacing:1px;">{label}</div>'
-                '<div style="color:{brd};font-size:17px;font-weight:bold;margin:6px 0">{dir}</div>'
-                '<div style="color:#ccc;font-size:12px;">Strike: <b>₹{strike:,.0f}</b></div>'
-                '<div style="color:#ccc;font-size:12px;">Entry ~<b>₹{prem:.0f}</b></div>'
-                '<div style="color:#ef5350;font-size:12px;">SL: <b>{sl}%</b></div>'
-                '<div style="color:#26a69a;font-size:12px;">Tgt: <b>{tgt}%</b></div>'
-                '<div style="color:#FFD700;font-size:13px;margin-top:6px;font-weight:bold;">'
-                'Conf: {conf}%</div>'
-                '</div>'.format(
-                    bg=bg, brd=brd,
-                    label=s["label"].strip(),
-                    dir=s["direction"],
-                    strike=s["rec_strike"],
-                    prem=s["premium_est"],
-                    sl=s["sl_pct"], tgt=s["tgt_pct"],
-                    conf=s["confidence"],
-                ),
-                unsafe_allow_html=True,
-            )
-
-        # Score breakdown
-        st.divider()
-        score_col, detail_col = st.columns([1, 2])
-        with score_col:
-            first = list(setups.values())[0]
-            ts_v, oi_v, tot_v = first["tech_score"], first["oi_score"], first["combined"]
-            score_color = "#4CAF50" if tot_v > 0 else "#ef5350" if tot_v < 0 else "#FF9800"
-            st.markdown(
-                '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
-                '<div style="color:#aaa;font-size:12px;">COMPOSITE SCORE</div>'
-                '<div style="font-size:40px;font-weight:bold;color:{c};">{t:+d}</div>'
-                '<div style="color:#ccc;font-size:12px;margin-top:8px;">'
-                'Tech: <b style="color:{tc}">{ts:+d}</b> &nbsp;|&nbsp; '
-                'OI: <b style="color:{oc}">{oi:+d}</b>'
-                '</div>'
-                '<div style="color:#aaa;font-size:11px;margin-top:6px;">'
-                '(+12 Strong Bull → −12 Strong Bear)</div>'
-                '</div>'.format(
-                    c=score_color, t=tot_v,
-                    tc="#4CAF50" if ts_v > 0 else "#ef5350",
-                    ts=ts_v,
-                    oc="#4CAF50" if oi_v > 0 else "#ef5350",
-                    oi=oi_v,
-                ),
-                unsafe_allow_html=True,
-            )
-        with detail_col:
-            st.markdown("##### Indicator Breakdown (15-min candles + OI)")
-            for b in first["bullets"]:
-                st.markdown(b)
-
+    st.markdown("## {} Option Chain  â€”  Expiry: **{}**".format(symbol, expiry))
+    st.markdown("**Spot: â‚¹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
+        underlying, meta["atm"], source_tag))
     st.divider()
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION B — MARKET METRICS + OI INTELLIGENCE
-    # ═══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 📊 Market Metrics")
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spot Price",    "₹{:,.1f}".format(underlying))
+    c1.metric("Spot Price",    "â‚¹{:,.1f}".format(underlying))
     c2.metric("PCR",           str(pcr), delta="Bullish" if pcr > 1.0 else "Bearish")
-    c3.metric("Max Pain",      "₹{:,.0f}".format(max_pain))
-    c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
-    c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+    c3.metric("Max Pain",      "â‚¹{:,.0f}".format(max_pain))
+    c4.metric("CE Resistance", "â‚¹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
+    c5.metric("PE Support",    "â‚¹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
 
+    # â”€â”€ OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) â”€
     oi1, oi2, oi3, oi4, oi5 = st.columns(5)
     call_sum_v = sig.get("call_sum", 0)
     put_sum_v  = sig.get("put_sum", 0)
     oi_diff_v  = sig.get("oi_difference", 0)
     itm_r      = sig.get("itm_ratio", 0)
-    strat_type = sig.get("strategy_type", "WAIT")
-    oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
-               delta="CE writing ↑" if call_sum_v > 0 else "CE covering ↓")
-    oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
-               delta="PE writing ↑" if put_sum_v > 0 else "PE covering ↓")
+    oi1.metric("Call Sum (ATMÂ±1)", "{:+.1f}K".format(call_sum_v),
+               delta="CE writing â†‘" if call_sum_v > 0 else "CE covering â†“")
+    oi2.metric("Put Sum (ATMÂ±1)", "{:+.1f}K".format(put_sum_v),
+               delta="PE writing â†‘" if put_sum_v > 0 else "PE covering â†“")
     oi3.metric("OI Difference", "{:+.1f}K".format(oi_diff_v),
                delta="Bearish" if oi_diff_v > 0 else "Bullish")
     oi4.metric("ITM Ratio", "{:.2f}x".format(itm_r),
                delta="Bullish" if itm_r > 1.5 else ("Bearish" if itm_r < 0.67 and itm_r > 0 else "Neutral"))
+    strat_type = sig.get("strategy_type", "WAIT")
     oi5.metric("Suggested Strategy", strat_type)
-
     st.divider()
 
-    # ── OI Signal analysis (collapsible) ─────────────────────────────────────
-    with st.expander("📋 OI Signal Analysis & Key Levels", expanded=False):
-        sig_col, reason_col = st.columns([1, 2])
-        with sig_col:
-            bg     = {"green": "#1a7a1a", "red": "#8b1a1a", "orange": "#7a5c00"}.get(sig["color"], "#333")
-            border = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(sig["color"], "#888")
+    sig_col, reason_col = st.columns([1, 2])
+    with sig_col:
+        bg     = {"green": "#1a7a1a", "red": "#8b1a1a", "orange": "#7a5c00"}.get(sig["color"], "#333")
+        border = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(sig["color"], "#888")
+        st.markdown(
+            '<div style="background:{};border:3px solid {};padding:25px;border-radius:14px;text-align:center;">'
+            '<div style="font-size:14px;color:#ccc;margin-bottom:6px;">TRADE SIGNAL</div>'
+            '<div style="font-size:32px;font-weight:bold;color:{};">{}</div>'
+            '<div style="font-size:16px;color:#ddd;margin-top:8px;">Confidence</div>'
+            '<div style="font-size:42px;font-weight:bold;color:white;">{}%</div>'
+            '</div>'.format(bg, border, border, sig["signal"], sig["confidence"]),
+            unsafe_allow_html=True
+        )
+        fig_g = go.Figure(go.Indicator(
+            mode="gauge+number", value=sig["confidence"],
+            title={"text": "Signal Strength", "font": {"size": 14}},
+            gauge={
+                "axis": {"range": [0, 100]}, "bar": {"color": border},
+                "steps": [
+                    {"range": [0,  40], "color": "#3d0000"},
+                    {"range": [40, 65], "color": "#3d3d00"},
+                    {"range": [65,100], "color": "#003d00"},
+                ],
+                "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.8, "value": sig["confidence"]},
+            },
+            number={"suffix": "%"},
+        ))
+        fig_g.update_layout(height=200, margin=dict(t=30, b=0, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig_g, use_container_width=True)
+
+    with reason_col:
+        st.markdown("#### Analysis Breakdown")
+        for r in sig["reasons"]:
+            rl   = r.lower()
+            icon = "ðŸŸ¢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
+                   "ðŸ”´" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "ðŸŸ¡"
+            st.markdown(icon + " " + r)
+        st.markdown("---")
+        st.markdown("#### Key Levels")
+        st.dataframe(pd.DataFrame({
+            "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
+            "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
+        }), hide_index=True, use_container_width=True)
+        st.markdown("---")
+        strat_note = sig.get("strategy_note", "")
+        if strat_note:
+            st.markdown("#### Strategy Recommendation")
+            strat_col = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
+                        "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
             st.markdown(
-                '<div style="background:{};border:3px solid {};padding:25px;border-radius:14px;text-align:center;">'
-                '<div style="font-size:14px;color:#ccc;margin-bottom:6px;">OI SIGNAL</div>'
-                '<div style="font-size:28px;font-weight:bold;color:{};">{}</div>'
-                '<div style="font-size:16px;color:#ddd;margin-top:8px;">Confidence</div>'
-                '<div style="font-size:42px;font-weight:bold;color:white;">{}%</div>'
-                '</div>'.format(bg, border, border, sig["signal"], sig["confidence"]),
+                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;border-left:4px solid {};">'
+                '<b style="color:{};">{}</b><br><span style="color:#ccc;font-size:13px;">{}</span>'
+                '</div>'.format(strat_col, strat_col, strat_type, strat_note),
                 unsafe_allow_html=True
             )
-            fig_g = go.Figure(go.Indicator(
-                mode="gauge+number", value=sig["confidence"],
-                title={"text": "OI Signal Strength", "font": {"size": 13}},
-                gauge={
-                    "axis": {"range": [0, 100]}, "bar": {"color": border},
-                    "steps": [
-                        {"range": [0,  40], "color": "#3d0000"},
-                        {"range": [40, 65], "color": "#3d3d00"},
-                        {"range": [65,100], "color": "#003d00"},
-                    ],
-                    "threshold": {"line": {"color": "white", "width": 3}, "thickness": 0.8, "value": sig["confidence"]},
-                },
-                number={"suffix": "%"},
-            ))
-            fig_g.update_layout(height=200, margin=dict(t=30, b=0, l=20, r=20), paper_bgcolor="rgba(0,0,0,0)")
-            st.plotly_chart(fig_g, use_container_width=True)
-        with reason_col:
-            st.markdown("##### OI Factors")
-            for r in sig["reasons"]:
-                rl   = r.lower()
-                icon = "🟢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
-                       "🔴" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "🟡"
-                st.markdown(icon + " " + r)
-            st.markdown("---")
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SMART TRADE INTELLIGENCE — Mark Douglas · Livermore · ICT · Van Tharp
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 🧠 Smart Trade Intelligence")
+    st.caption("Mark Douglas · Jesse Livermore · ICT/Smart Money · Van Tharp · Historical Expiry Learning")
+
+    with st.spinner("Running multi-framework analysis…"):
+        _daily_c   = _get_candles(symbol, is_index, 40, data_source)
+        _intra_raw = _get_intraday(symbol, "15min", data_source)
+        _intra_t   = _compute_tech(_intra_raw) if not _intra_raw.empty else pd.DataFrame()
+        _dte_val   = max(0, int(ea.hours_to_expiry(expiry) / 6.25))
+        _sig_ext   = {**sig, "underlying_proxy": underlying}
+
+        _douglas   = sa.mark_douglas_score(_sig_ext, _intra_t, pcr, _dte_val)
+        _livermore = sa.livermore_analysis(_daily_c, underlying, symbol)
+        _ict       = sa.ict_analysis(df, underlying, _sig_ext)
+        _history   = sa.learn_from_expiry_history(_daily_c)
+        _atm_prem  = float(df.iloc[(df["strike"]-underlying).abs().idxmin()]["ce_ltp"]) \
+                     if not df.empty else underlying * 0.008
+        _tharp     = sa.van_tharp_sizing(underlying, max(_atm_prem, underlying * 0.005),
+                                         _dte_val, symbol)
+        _conf, _dir, _reasons = sa.master_confidence(_douglas, _livermore, _ict, _history)
+
+    _conf_col = "#4CAF50" if "CE" in _dir else "#ef5350" if "PE" in _dir else "#FF9800"
+
+    mc1, mc2, mc3 = st.columns([1, 1, 2])
+    with mc1:
+        st.markdown(
+            '<div style="background:#0d1a0d;border:3px solid {c};padding:20px;'
+            'border-radius:14px;text-align:center;">'
+            '<div style="color:#aaa;font-size:12px;letter-spacing:1px;">MASTER CONFIDENCE</div>'
+            '<div style="font-size:52px;font-weight:bold;color:{c};">{p}%</div>'
+            '<div style="font-size:17px;font-weight:bold;color:{c};">{d}</div>'
+            '</div>'.format(c=_conf_col, p=_conf, d=_dir),
+            unsafe_allow_html=True,
+        )
+    with mc2:
+        st.markdown(
+            '<div style="background:#1e1e2e;padding:16px;border-radius:12px;">'
+            '<div style="color:#aaa;font-size:11px;">MARK DOUGLAS VERDICT</div>'
+            '<div style="font-size:14px;color:#eee;margin:6px 0;font-weight:bold;">{}</div>'
+            '<div style="color:#aaa;font-size:11px;">{}/{} indicators agree</div>'
+            '<div style="color:#ccc;font-size:12px;margin-top:8px;">{}</div>'
+            '</div>'.format(
+                _douglas["verdict"],
+                max(_douglas["bull"], _douglas["bear"]),
+                _douglas["total"], _douglas["advice"],
+            ),
+            unsafe_allow_html=True,
+        )
+    with mc3:
+        st.markdown("**Multi-framework reasoning:**")
+        for _ln in _reasons:
+            st.markdown("• " + _ln)
+
+    st.divider()
+    _fa1, _fa2 = st.columns(2)
+    with _fa1:
+        with st.expander("📖 Jesse Livermore — Trend, Stage & Pivots"):
+            lv = _livermore
+            _tc = "#4CAF50" if lv["trend"]=="UPTREND" else "#ef5350" if lv["trend"]=="DOWNTREND" else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
+                '<b style="color:{c};">{t}</b> &nbsp;|&nbsp;<span style="color:#ccc;">{s}</span><br><br>'
+                '<span style="color:#aaa;font-size:12px;">5d momentum: <b>{m:+.2f}%</b> '
+                '| EMA-slow: <b>&#8377;{e:.0f}</b> | 20d range: <b>&#8377;{r:.0f}</b></span><br>'
+                '<i style="color:#ddd;font-size:12px;">{tape}</i></div>'.format(
+                    c=_tc, t=lv["trend"], s=lv["stage"],
+                    m=lv["mom5_pct"], e=lv["ema_slow"], r=lv["range20"], tape=lv["tape"]),
+                unsafe_allow_html=True,
+            )
+            if lv.get("pivot_hi"):
+                st.markdown("**Resistance:** " + " | ".join("&#8377;{:,.0f}".format(p) for p in lv["pivot_hi"]))
+            if lv.get("pivot_lo"):
+                st.markdown("**Support:** "    + " | ".join("&#8377;{:,.0f}".format(p) for p in lv["pivot_lo"]))
+
+        with st.expander("🏦 ICT / Smart Money — Institutional Footprints"):
+            ic = _ict
+            st.info(ic.get("narrative", ""))
             st.dataframe(pd.DataFrame({
-                "Level": ["Spot Price","Max Pain","CE Resistance (OI)","PE Support (OI)"],
-                "Price": [underlying, max_pain, sig["max_ce_resistance"], sig["max_pe_support"]],
+                "Level": ["CE Wall (Resistance)", "PE Wall (Support)", "Max Pain Magnet"],
+                "Strike": [ic.get("ce_wall",0), ic.get("pe_wall",0), ic.get("max_pain",0)],
+                "Dist from Spot": ["&#8377;{:+.0f}".format(ic.get("dist_ce",0)),
+                                   "&#8377;{:+.0f}".format(-ic.get("dist_pe",0)),
+                                   "&#8377;{:+.0f}".format(ic.get("dist_mp",0))],
             }), hide_index=True, use_container_width=True)
-            strat_note = sig.get("strategy_note", "")
-            if strat_note:
-                strat_c = "#4CAF50" if "condor" in strat_note.lower() or "spread" in strat_note.lower() else \
-                          "#26a69a" if "buy" in strat_note.lower() else "#FF9800"
-                st.markdown(
-                    '<div style="background:#1e1e2e;padding:10px;border-radius:8px;border-left:4px solid {};">'
-                    '<b style="color:{};">{}</b><br>'
-                    '<span style="color:#ccc;font-size:13px;">{}</span>'
-                    '</div>'.format(strat_c, strat_c, strat_type, strat_note),
-                    unsafe_allow_html=True
-                )
+
+    with _fa2:
+        with st.expander("💰 Van Tharp — Position Sizing & R-Multiple"):
+            vt = _tharp
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
+                '<b style="color:#FFD700;">1R = 1.5% of &#8377;{:,.0f} capital</b><br><br>'
+                '<table style="width:100%;color:#ccc;font-size:13px;">'
+                '<tr><td>ATM Premium</td><td><b>&#8377;{}</b></td></tr>'
+                '<tr><td>Stop-Loss ({}%)</td><td style="color:#ef5350;"><b>&#8377;{}</b></td></tr>'
+                '<tr><td>Target (2R)</td><td style="color:#26a69a;"><b>&#8377;{}</b></td></tr>'
+                '<tr><td>Lot Size</td><td><b>{} units</b></td></tr>'
+                '<tr><td>Max Lots</td><td style="color:#FFD700;"><b>{}</b></td></tr>'
+                '<tr><td>Risk/Lot</td><td><b>&#8377;{:,}</b></td></tr>'
+                '<tr><td>Expectancy</td><td><b>{:.2f}R</b></td></tr>'
+                '</table></div>'.format(
+                    vt["capital"], vt["premium_est"], int(vt["sl_pct"]),
+                    vt["sl_price"], vt["target_2r"], vt["lot_size"],
+                    vt["max_lots"], int(vt["risk_per_lot"]), vt["expectancy_r"]),
+                unsafe_allow_html=True,
+            )
+            st.caption("Van Tharp: Size so 1 stop-out = 1.5% of capital. Never risk more than 2%.")
+
+        with st.expander("📚 Historical Expiry Learning — Pattern Match"):
+            hist = _history
+            st.info(hist.get("summary", "No data."))
+            _bc = "#4CAF50" if "BULLISH" in hist.get("pattern_bias","") else \
+                  "#ef5350" if "BEARISH" in hist.get("pattern_bias","") else "#FF9800"
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:10px;border-radius:8px;'
+                'border-left:4px solid {c};">'
+                '<b style="color:{c};">Today matches: {b}</b></div>'.format(
+                    c=_bc, b=hist.get("pattern_bias","")),
+                unsafe_allow_html=True,
+            )
+            if hist.get("lesson"):
+                st.success("💡 " + hist["lesson"])
+            if hist.get("patterns"):
+                _hdf = pd.DataFrame(hist["patterns"])[
+                    ["date","weekday","rsi","ema_trend","range_pct","close_chg","outcome"]]
+                _hdf.columns = ["Date","Day","RSI","EMA","Range%","Chg%","Outcome"]
+                def _c_out(v):
+                    return "color:#4CAF50" if v=="BULLISH" else "color:#ef5350" if v=="BEARISH" else "color:#FF9800"
+                st.dataframe(_hdf.style.map(_c_out, subset=["Outcome"]),
+                             hide_index=True, use_container_width=True)
+
+    with st.expander("📊 Mark Douglas — Full Confluence Grid"):
+        _chk = pd.DataFrame(_douglas["checks"], columns=["Indicator","Signal"])
+        _chk["Signal"] = _chk["Signal"].map({1:"✅ BULL", -1:"❌ BEAR", 0:"⚪ NEUTRAL"})
+        st.dataframe(_chk, hide_index=True, use_container_width=True)
+        st.markdown("**{} Bull | {} Bear | {} Neutral** of {} → **{}**".format(
+            _douglas["bull"], _douglas["bear"], _douglas["neutral"],
+            _douglas["total"], _douglas["verdict"]))
 
     st.divider()
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION C — INTRADAY TECHNICAL CHART (MACD + RSI + EMA + VWAP)
-    # ═══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 📈 Intraday Technical Chart")
-
-    # Intraday timeframe selector for the chart
-    chart_tf = st.radio(
-        "Chart Interval", ["5min", "10min", "15min", "30min", "1hr"],
-        index=2, horizontal=True, key="live_chart_tf",
-        help="Fetch intraday candles at this interval for MACD/RSI/VWAP/EMA chart"
-    )
-    if chart_tf != "15min":
-        chart_raw  = _get_intraday_candles_cached(symbol, chart_tf, data_source)
-        chart_tech = compute_technicals(chart_raw) if not chart_raw.empty else intra_tech
-    else:
-        chart_raw  = intra_raw
-        chart_tech = intra_tech
-
-    if chart_tech is not None and not chart_tech.empty and len(chart_tech) >= 5:
-        from plotly.subplots import make_subplots as _msp
-        xc = chart_tech["datetime"].astype(str)
-        fig_intra = _msp(
-            rows=4, cols=1, shared_xaxes=True,
-            row_heights=[0.48, 0.18, 0.18, 0.16],
-            vertical_spacing=0.025,
-            subplot_titles=[
-                "Price · VWAP (orange) · EMA9 (blue) · EMA20 (amber)",
-                "MACD (12,26,9)",
-                "RSI 14",
-                "Net Volume",
-            ],
-        )
-        # Panel 1 — Candles + indicators
-        fig_intra.add_trace(go.Candlestick(
-            x=xc, open=chart_tech["open"], high=chart_tech["high"],
-            low=chart_tech["low"], close=chart_tech["close"], name="OHLC",
-            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        ), row=1, col=1)
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["vwap"], name="VWAP",
-            line=dict(color="#FF6F00", width=1.5, dash="dot")), row=1, col=1)
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["ema9"],  name="EMA9",
-            line=dict(color="#42A5F5", width=1.5)), row=1, col=1)
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["ema20"], name="EMA20",
-            line=dict(color="#FFA726", width=1.5)), row=1, col=1)
-        # Panel 2 — MACD
-        hist_col = ["#26a69a" if v >= 0 else "#ef5350" for v in chart_tech["macd_hist"]]
-        fig_intra.add_trace(go.Bar(x=xc, y=chart_tech["macd_hist"], name="MACD Hist",
-            marker_color=hist_col, opacity=0.7), row=2, col=1)
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["macd"],     name="MACD",
-            line=dict(color="#42A5F5", width=1.5)), row=2, col=1)
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["macd_sig"], name="Signal",
-            line=dict(color="#FFA726", width=1.5)), row=2, col=1)
-        fig_intra.add_hline(y=0, line_dash="dash", line_color="#555", row=2, col=1)
-        # Panel 3 — RSI
-        fig_intra.add_trace(go.Scatter(x=xc, y=chart_tech["rsi"], name="RSI 14",
-            line=dict(color="#CE93D8", width=1.5),
-            fill="tozeroy", fillcolor="rgba(206,147,216,0.08)"), row=3, col=1)
-        for lvl, lc in [(70, "#ef5350"), (50, "#888"), (30, "#26a69a")]:
-            fig_intra.add_hline(y=lvl, line_dash="dash", line_color=lc,
-                                line_width=1, row=3, col=1)
-        # Panel 4 — Net Volume
-        nv_col = ["#26a69a" if v >= 0 else "#ef5350" for v in chart_tech["net_vol"]]
-        fig_intra.add_trace(go.Bar(x=xc, y=chart_tech["net_vol"], name="Net Vol",
-            marker_color=nv_col, opacity=0.8), row=4, col=1)
-
-        fig_intra.update_layout(
-            height=780, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=50, b=10, l=60, r=10),
-            legend=dict(orientation="h", y=1.04, x=0, font=dict(size=10)),
-            xaxis_rangeslider_visible=False,
-        )
-        for i in range(1, 5):
-            fig_intra.update_xaxes(gridcolor="#333", row=i, col=1)
-            fig_intra.update_yaxes(gridcolor="#333", row=i, col=1)
-        st.plotly_chart(fig_intra, use_container_width=True)
-    else:
-        st.info(
-            "Intraday candle data unavailable for this interval/source.\n\n"
-            "**Angel One (Live)** provides real 5/15/30-min candles. "
-            "**yfinance fallback** works for most NSE indices but may be delayed."
-        )
-
-    st.divider()
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION D — OI CHARTS
-    # ═══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 📊 Open Interest Analysis")
     cc1, cc2 = st.columns(2)
     with cc1:
-        st.markdown("#### Open Interest Distribution")
+        st.markdown("#### Open Interest Distribution â€” Murphy Support/Resistance")
         f = go.Figure()
-        f.add_trace(go.Bar(x=df["strike"], y=df["ce_oi"]/1000, name="Call OI", marker_color="#ef5350", opacity=0.85))
-        f.add_trace(go.Bar(x=df["strike"], y=df["pe_oi"]/1000, name="Put OI",  marker_color="#26a69a", opacity=0.85))
+        # CE OI bars (resistance above spot)
+        ce_colors = ["#b71c1c" if s > underlying else "#ef5350" for s in df["strike"]]
+        pe_colors = ["#004d40" if s < underlying else "#26a69a" for s in df["strike"]]
+        f.add_trace(go.Bar(x=df["strike"], y=df["ce_oi"]/1000, name="Call OI (Resistance)",
+                           marker_color=ce_colors, opacity=0.9))
+        f.add_trace(go.Bar(x=df["strike"], y=df["pe_oi"]/1000, name="Put OI (Support)",
+                           marker_color=pe_colors, opacity=0.9))
         f.add_vline(x=underlying, line_dash="dash", line_color="white",
                     annotation_text="Spot {}".format(int(underlying)), annotation_font_color="white")
-        f.add_vline(x=max_pain, line_dash="dot", line_color="yellow",
-                    annotation_text="MaxPain {}".format(int(max_pain)), annotation_font_color="yellow")
-        f.update_layout(barmode="group", height=320,
+        f.add_vline(x=max_pain, line_dash="dot", line_color="#FFD700",
+                    annotation_text="MaxPain {}".format(int(max_pain)), annotation_font_color="#FFD700")
+        f.add_vline(x=sig["max_ce_resistance"], line_dash="dot", line_color="#ef5350",
+                    annotation_text="Resist {}".format(int(sig["max_ce_resistance"])),
+                    annotation_font_color="#ef5350", annotation_position="top left")
+        f.add_vline(x=sig["max_pe_support"], line_dash="dot", line_color="#26a69a",
+                    annotation_text="Support {}".format(int(sig["max_pe_support"])),
+                    annotation_font_color="#26a69a")
+        f.update_layout(barmode="overlay", height=320,
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                         legend=dict(orientation="h", y=1.1),
                         xaxis=dict(title="Strike", gridcolor="#333"),
@@ -874,19 +561,35 @@ with tab_live:
         st.plotly_chart(f, use_container_width=True)
 
     with cc2:
-        st.markdown("#### Change in OI")
+        st.markdown("#### OI Change â€” Velocity & Direction (Net Flow)")
+        # Net OI flow: PE build - CE build at each strike
+        net_oi_flow = (df["pe_chg_oi"] - df["ce_chg_oi"]) / 1000
+        flow_colors = ["#26a69a" if v > 0 else "#ef5350" for v in net_oi_flow]
         f2 = go.Figure()
-        f2.add_trace(go.Bar(x=df["strike"], y=df["ce_chg_oi"]/1000, name="CE Chg OI", marker_color="#ef5350", opacity=0.85))
-        f2.add_trace(go.Bar(x=df["strike"], y=df["pe_chg_oi"]/1000, name="PE Chg OI", marker_color="#26a69a", opacity=0.85))
+        # Raw CE/PE change bars (lighter)
+        f2.add_trace(go.Bar(x=df["strike"], y=df["ce_chg_oi"]/1000, name="CE Build",
+                            marker_color="#ef5350", opacity=0.4))
+        f2.add_trace(go.Bar(x=df["strike"], y=df["pe_chg_oi"]/1000, name="PE Build",
+                            marker_color="#26a69a", opacity=0.4))
+        # Net flow line (the KEY signal: positive = bullish PE building)
+        f2.add_trace(go.Scatter(x=df["strike"], y=net_oi_flow, name="Net OI Flow (PEâˆ’CE)",
+                                mode="lines+markers",
+                                line=dict(color="#FFD700", width=2.5),
+                                marker=dict(color=flow_colors, size=8)))
+        f2.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.5)
         f2.add_vline(x=underlying, line_dash="dash", line_color="white",
                      annotation_text="Spot {}".format(int(underlying)), annotation_font_color="white")
         f2.update_layout(barmode="group", height=320,
                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                          legend=dict(orientation="h", y=1.1),
                          xaxis=dict(title="Strike", gridcolor="#333"),
-                         yaxis=dict(title="Chg OI (thousands)", gridcolor="#333"),
+                         yaxis=dict(title="Chg OI (K) â€” +ve = PE writing (bullish)", gridcolor="#333"),
                          margin=dict(t=20, b=10))
         st.plotly_chart(f2, use_container_width=True)
+        # Net OI flow summary
+        net_total = net_oi_flow.sum()
+        flow_bias = "ðŸŸ¢ PE writing dominates (Bullish)" if net_total > 0 else "ðŸ”´ CE writing dominates (Bearish)"
+        st.caption("Net OI Flow: {:+.1f}K â†’ {}".format(net_total, flow_bias))
 
     ic1, ic2 = st.columns(2)
     with ic1:
@@ -909,196 +612,51 @@ with tab_live:
     with ic2:
         st.markdown("#### PCR Interpretation")
         if   pcr > 1.5: interp, pcr_col = "EXTREMELY BULLISH",           "#00e676"
-        elif pcr > 1.2: interp, pcr_col = "BULLISH — strong put writing", "#4CAF50"
+        elif pcr > 1.2: interp, pcr_col = "BULLISH â€” strong put writing", "#4CAF50"
         elif pcr > 0.8: interp, pcr_col = "NEUTRAL to BULLISH",           "#8BC34A"
         elif pcr > 0.5: interp, pcr_col = "NEUTRAL to BEARISH",           "#FF9800"
-        else:           interp, pcr_col = "BEARISH — heavy call writing",  "#f44336"
+        else:           interp, pcr_col = "BEARISH â€” heavy call writing",  "#f44336"
         st.markdown(
             '<div style="background:#1e1e2e;padding:20px;border-radius:12px;">'
             '<div style="font-size:48px;font-weight:bold;color:{};text-align:center;">{}</div>'
             '<div style="font-size:16px;color:{};text-align:center;margin-top:8px;">{}</div>'
             '<hr style="border-color:#333;margin:15px 0;">'
             '<div style="font-size:13px;color:#aaa;">'
-            'PCR &lt;0.5=Bearish | 0.5–0.8=Neutral-Bearish<br>'
-            'PCR 0.8–1.2=Neutral | 1.2–1.5=Bullish | &gt;1.5=Extremely Bullish'
+            'PCR &lt;0.5=Bearish | 0.5â€“0.8=Neutral-Bearish<br>'
+            'PCR 0.8â€“1.2=Neutral | 1.2â€“1.5=Bullish | &gt;1.5=Extremely Bullish'
             '</div></div>'.format(pcr_col, pcr, pcr_col, interp),
             unsafe_allow_html=True
         )
 
     st.divider()
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION E — LEGENDARY TRADER ANALYSIS
-    # ═══════════════════════════════════════════════════════════════════════════
-    st.markdown("### 🧠 Smart Trade Intelligence")
-    st.caption("Analysis through Mark Douglas · Jesse Livermore · ICT · Van Tharp · Historical Expiry Learning")
-
-    with st.spinner("Running multi-framework analysis…"):
-        # Add proxy underlying to oi_sig for max-pain comparison
-        _sig_ext = {**sig, "underlying_proxy": underlying}
-        _daily_candles = _get_candles(symbol, is_index, 40, data_source)
-
-        _douglas  = sa.mark_douglas_score(_sig_ext, intra_tech, pcr, setups["15min"]["dte"] if setups else 7)
-        _livermore = sa.livermore_analysis(_daily_candles, underlying, symbol)
-        _ict      = sa.ict_analysis(df, underlying, _sig_ext)
-        _history  = sa.learn_from_expiry_history(_daily_candles)
-        _tharp    = sa.van_tharp_sizing(underlying,
-                                        float(df.iloc[(df["strike"]-underlying).abs().idxmin()]["ce_ltp"])
-                                        if not df.empty else underlying * 0.008,
-                                        setups["15min"]["dte"] if setups else 7,
-                                        symbol)
-        _conf, _direction, _reasoning = sa.master_confidence(_douglas, _livermore, _ict, _history)
-
-    # ── Master confidence card ────────────────────────────────────────────────
-    mc1, mc2, mc3 = st.columns([1, 1, 2])
-    _conf_col = "#4CAF50" if "CE" in _direction else "#ef5350" if "PE" in _direction else "#FF9800"
-    with mc1:
-        st.markdown(
-            '<div style="background:#0d1a0d;border:3px solid {c};padding:20px;'
-            'border-radius:14px;text-align:center;">'
-            '<div style="color:#aaa;font-size:12px;">MASTER CONFIDENCE</div>'
-            '<div style="font-size:48px;font-weight:bold;color:{c};">{p}%</div>'
-            '<div style="font-size:18px;font-weight:bold;color:{c};margin-top:4px;">{d}</div>'
-            '</div>'.format(c=_conf_col, p=_conf, d=_direction),
-            unsafe_allow_html=True,
-        )
-    with mc2:
-        st.markdown(
-            '<div style="background:#1e1e2e;padding:16px;border-radius:12px;height:100%;">'
-            '<div style="color:#aaa;font-size:12px;">MARK DOUGLAS VERDICT</div>'
-            '<div style="font-size:14px;color:#eee;margin:6px 0;">{}</div>'
-            '<div style="color:#aaa;font-size:11px;">{}/{} signals agree</div>'
-            '<div style="font-size:12px;color:#ccc;margin-top:8px;">{}</div>'
-            '</div>'.format(
-                _douglas["verdict"],
-                max(_douglas["bull"], _douglas["bear"]), _douglas["total"],
-                _douglas["advice"]
-            ),
-            unsafe_allow_html=True,
-        )
-    with mc3:
-        st.markdown("**Multi-framework reasoning:**")
-        for line in _reasoning:
-            st.markdown("• " + line)
-
-    st.divider()
-
-    # ── Expandable framework details ──────────────────────────────────────────
-    fa1, fa2 = st.columns(2)
-
-    with fa1:
-        with st.expander("📖 Jesse Livermore — Trend & Stage Analysis", expanded=False):
-            lv = _livermore
-            trend_col = "#4CAF50" if lv["trend"] == "UPTREND" else "#ef5350" if lv["trend"] == "DOWNTREND" else "#FF9800"
-            st.markdown(
-                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
-                '<b style="color:{c};">{t}</b><br>'
-                '<span style="color:#ccc;font-size:13px;">{s}</span><br><br>'
-                '<span style="color:#aaa;font-size:12px;">5-day momentum: {:+.2f}%'
-                ' | EMA-slow: ₹{:.1f} | Range(20d): ₹{:.0f}</span><br>'
-                '<i style="color:#ddd;font-size:12px;">{tape}</i>'
-                '</div>'.format(
-                    lv["mom5_pct"], lv["ema_slow"], lv["range20"],
-                    c=trend_col, t=lv["trend"], s=lv["stage"], tape=lv["tape"]
-                ),
-                unsafe_allow_html=True,
-            )
-            if lv["pivot_hi"]:
-                st.markdown("**Resistance pivots:** " + ", ".join("₹{:,.0f}".format(p) for p in lv["pivot_hi"]))
-            if lv["pivot_lo"]:
-                st.markdown("**Support pivots:** " + ", ".join("₹{:,.0f}".format(p) for p in lv["pivot_lo"]))
-
-        with st.expander("🏦 ICT / Smart Money — Institutional Footprints", expanded=False):
-            ic = _ict
-            st.markdown(ic.get("narrative", ""))
-            ic_df = pd.DataFrame({
-                "Level":    ["CE Wall (Resistance)", "PE Wall (Support)", "Max Pain Magnet"],
-                "Strike":   [ic.get("ce_wall", 0), ic.get("pe_wall", 0), ic.get("max_pain", 0)],
-                "Distance": ["₹{:+.0f}".format(ic.get("dist_ce", 0)),
-                             "₹{:+.0f}".format(-ic.get("dist_pe", 0)),
-                             "₹{:+.0f}".format(ic.get("dist_mp", 0))],
-            })
-            st.dataframe(ic_df, hide_index=True, use_container_width=True)
-            st.markdown("**Top CE OI strikes (resistance pool):**")
-            for row in ic.get("top3_ce", []):
-                st.markdown("  ₹{strike:.0f} — {ce_oi:,.0f} contracts".format(**row))
-
-    with fa2:
-        with st.expander("💰 Van Tharp — R-Multiple & Position Sizing", expanded=False):
-            vt = _tharp
-            st.markdown(
-                '<div style="background:#1e1e2e;padding:14px;border-radius:10px;">'
-                '<b style="color:#FFD700;">1R Risk Model  (1.5% of ₹{:,.0f} capital)</b><br><br>'
-                '<table style="width:100%;color:#ccc;font-size:13px;">'
-                '<tr><td>ATM Premium</td><td><b>₹{}</b></td></tr>'
-                '<tr><td>Stop-Loss ({}%)</td><td style="color:#ef5350;"><b>₹{}</b></td></tr>'
-                '<tr><td>Target (2R)</td><td style="color:#26a69a;"><b>₹{}</b></td></tr>'
-                '<tr><td>Lot Size</td><td><b>{} units</b></td></tr>'
-                '<tr><td>Cost per Lot</td><td><b>₹{:,}</b></td></tr>'
-                '<tr><td>Max Lots (1R = 1.5%)</td><td style="color:#FFD700;"><b>{}</b></td></tr>'
-                '<tr><td>Risk per Lot</td><td><b>₹{:,}</b></td></tr>'
-                '<tr><td>System Expectancy</td><td><b>{:.2f}R</b></td></tr>'
-                '</table></div>'.format(
-                    vt["capital"], vt["premium_est"], int(vt["sl_pct"]),
-                    vt["sl_price"], vt["target_2r"], vt["lot_size"],
-                    int(vt["cost_1lot"]), vt["max_lots"],
-                    int(vt["risk_per_lot"]), vt["expectancy_r"]
-                ),
-                unsafe_allow_html=True,
-            )
-            st.caption("Van Tharp: Size so that 1 stop-out = 1.5% capital loss. Never risk more than 2%.")
-
-        with st.expander("📚 Historical Expiry Learning — What the Past Says", expanded=False):
-            hist = _history
-            st.markdown("**Pattern summary:**")
-            st.info(hist.get("summary", "No data."))
-
-            bias_col = "#4CAF50" if "BULLISH" in hist.get("pattern_bias", "") else \
-                       "#ef5350" if "BEARISH" in hist.get("pattern_bias", "") else "#FF9800"
-            st.markdown(
-                '<div style="background:#1e1e2e;padding:12px;border-radius:8px;'
-                'border-left:4px solid {};">'
-                '<b style="color:{};">Today matches: {}</b>'
-                '</div>'.format(bias_col, bias_col, hist.get("pattern_bias", "")),
-                unsafe_allow_html=True,
-            )
-            if hist.get("lesson"):
-                st.markdown("**💡 Lesson from last session:**")
-                st.success(hist["lesson"])
-
-            if hist.get("patterns"):
-                hdf = pd.DataFrame(hist["patterns"])[[
-                    "date", "weekday", "rsi", "ema_trend", "range_pct", "close_chg", "outcome"
-                ]]
-                hdf.columns = ["Date", "Day", "RSI", "EMA", "Range%", "Chg%", "Outcome"]
-
-                def _oc2(val):
-                    return "color:#4CAF50" if val == "BULLISH" else \
-                           "color:#ef5350" if val == "BEARISH" else "color:#FF9800"
-
-                st.dataframe(
-                    hdf.style.map(_oc2, subset=["Outcome"]),
-                    hide_index=True, use_container_width=True
-                )
-
-    # ── Mark Douglas confluence grid ──────────────────────────────────────────
-    with st.expander("📊 Mark Douglas — Full Confluence Grid", expanded=False):
-        chk_df = pd.DataFrame(_douglas["checks"], columns=["Indicator", "Signal"])
-        chk_df["Signal"] = chk_df["Signal"].map({1: "✅ BULL", -1: "❌ BEAR", 0: "⚪ NEUTRAL"})
-        st.dataframe(chk_df, hide_index=True, use_container_width=True)
-        st.markdown(
-            "**{} Bull | {} Bear | {} Neutral** out of {} checks — **{}**".format(
-                _douglas["bull"], _douglas["bear"], _douglas["neutral"],
-                _douglas["total"], _douglas["verdict"]
-            )
-        )
-
-    st.divider()
-    st.markdown("### Tomorrow's Prediction")
-
+    # â”€â”€ Expiry proximity alert â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    h_left = ea.hours_to_expiry(expiry)
     atm_iv = float(df.iloc[(df["strike"] - underlying).abs().idxmin()]["ce_iv"])
     if atm_iv == 0:
         atm_iv = float(df["ce_iv"][df["ce_iv"] > 0].mean()) if (df["ce_iv"] > 0).any() else 15.0
+
+    if 0 < h_left <= 6.5:  # expiry day
+        st.markdown(
+            '<div style="background:#3d0000;border:2px solid #ef5350;padding:12px;border-radius:10px;margin-bottom:10px;">'
+            '<b style="color:#ef5350;">âš¡ EXPIRY DAY</b> â€” {:.1f} market hours left | '
+            'Switch to <b>ðŸ“… Expiry Signals</b> tab for scalp targets</div>'.format(h_left),
+            unsafe_allow_html=True
+        )
+    elif 0 < h_left <= 24:
+        next_info = ea.next_expiry_info(
+            meta.get("all_expiries", [expiry]), expiry, underlying, atm_iv)
+        if "error" not in next_info:
+            st.markdown(
+                '<div style="background:#1a2a00;border:2px solid #8BC34A;padding:12px;border-radius:10px;margin-bottom:10px;">'
+                '<b style="color:#8BC34A;">â° Expiry Tomorrow</b> â€” Next expiry: <b>{}</b> | '
+                'Switch to <b>ðŸ“… Expiry Signals</b> for next-expiry analysis</div>'.format(
+                    next_info.get("next_expiry", "")),
+                unsafe_allow_html=True
+            )
+
+    st.markdown("### Prediction â€” {} Â· ATM IV: {}%".format(
+        "Today's Range" if h_left <= 6.5 else "Tomorrow", round(atm_iv, 1)))
 
     daily_move  = underlying * (atm_iv / 100) * math.sqrt(1 / 252)
     upper_level = underlying + daily_move
@@ -1117,9 +675,9 @@ with tab_live:
         st.markdown(
             '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
             '<div style="color:#aaa;font-size:13px;">Expected Daily Range (IV={}%)</div>'
-            '<div style="font-size:22px;font-weight:bold;color:#26a69a;margin:8px 0;">±₹{:,.0f}</div>'
-            '<div style="color:#ccc;font-size:14px;">Upper: <b>₹{:,.0f}</b></div>'
-            '<div style="color:#ccc;font-size:14px;">Lower: <b>₹{:,.0f}</b></div>'
+            '<div style="font-size:22px;font-weight:bold;color:#26a69a;margin:8px 0;">Â±â‚¹{:,.0f}</div>'
+            '<div style="color:#ccc;font-size:14px;">Upper: <b>â‚¹{:,.0f}</b></div>'
+            '<div style="color:#ccc;font-size:14px;">Lower: <b>â‚¹{:,.0f}</b></div>'
             '</div>'.format(round(atm_iv, 1), daily_move, upper_level, lower_level),
             unsafe_allow_html=True
         )
@@ -1139,8 +697,8 @@ with tab_live:
         st.markdown(
             '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
             '<div style="color:#aaa;font-size:13px;">Max Pain Magnet</div>'
-            '<div style="font-size:22px;font-weight:bold;color:#FFD700;margin:8px 0;">₹{:,.0f}</div>'
-            '<div style="color:#ccc;font-size:13px;">₹{:,.0f} {} spot</div>'
+            '<div style="font-size:22px;font-weight:bold;color:#FFD700;margin:8px 0;">â‚¹{:,.0f}</div>'
+            '<div style="color:#ccc;font-size:13px;">â‚¹{:,.0f} {} spot</div>'
             '<div style="color:#ccc;font-size:13px;">{}</div>'
             '</div>'.format(max_pain, abs(pain_diff), mp_dir, mp_pull),
             unsafe_allow_html=True
@@ -1149,9 +707,9 @@ with tab_live:
     st.markdown(
         '<div style="background:#1e1e2e;padding:15px;border-radius:10px;margin-top:10px;">'
         '<b style="color:#aaa;">Key Levels for Tomorrow</b><br>'
-        '<span style="color:#ef5350;">Resistance: ₹{:,.0f} (max CE OI)  |  Upper: ₹{:,.0f}</span><br>'
-        '<span style="color:#26a69a;">Support: ₹{:,.0f} (max PE OI)  |  Lower: ₹{:,.0f}</span><br>'
-        '<span style="color:#FFD700;">Max Pain: ₹{:,.0f}  |  Spot: ₹{:,.0f}</span>'
+        '<span style="color:#ef5350;">Resistance: â‚¹{:,.0f} (max CE OI)  |  Upper: â‚¹{:,.0f}</span><br>'
+        '<span style="color:#26a69a;">Support: â‚¹{:,.0f} (max PE OI)  |  Lower: â‚¹{:,.0f}</span><br>'
+        '<span style="color:#FFD700;">Max Pain: â‚¹{:,.0f}  |  Spot: â‚¹{:,.0f}</span>'
         '</div>'.format(
             sig["max_ce_resistance"], upper_level,
             sig["max_pe_support"],    lower_level,
@@ -1188,9 +746,311 @@ with tab_live:
     st.caption("Data: {}  |  For educational purposes only. Not financial advice.".format(source_tag))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — BACKTEST & MODEL TRAINING
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 2 â€” MARKET SCANNER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+with tab_scan:
+    st.markdown("## ðŸ” Market Scanner")
+    st.markdown(
+        "Multi-instrument trending analysis using **Murphy's OI+Price 4-scenario**, "
+        "**Natenberg IV Rank**, and **McMillan PCR** methodologies."
+    )
+
+    sc1, sc2 = st.columns([1, 3])
+    with sc1:
+        scan_stocks = st.checkbox("Include F&O Stocks", value=False)
+        scan_demo_mode = (data_source == "Demo Mode")
+
+    with sc2:
+        st.markdown(
+            "**Murphy (1999) OI Framework:** Rising price + Rising OI = Bullish (fresh longs) Â· "
+            "Rising price + Falling OI = Short covering (weak) Â· "
+            "Falling price + Rising OI = Bearish (fresh shorts)"
+        )
+
+    if st.button("ðŸ”„ Scan Now", type="primary", key="scan_btn"):
+        with st.spinner("Scanning instrumentsâ€¦"):
+            if scan_demo_mode or data_source != "Angel One (Live)":
+                scan_results = sc.scan_demo(include_stocks=scan_stocks)
+            else:
+                scan_results = sc.scan_live(symbol, df, meta, sig, include_stocks=scan_stocks)
+        st.session_state["scan_results"] = scan_results
+
+    scan_results = st.session_state.get("scan_results")
+    if not scan_results:
+        st.info("Click **Scan Now** to analyse trending instruments.")
+    else:
+        # Summary conviction bar
+        bullish  = [r for r in scan_results if r["signal"] == "BUY CALL"]
+        bearish  = [r for r in scan_results if r["signal"] == "BUY PUT"]
+        watching = [r for r in scan_results if r["signal"] == "WATCH"]
+
+        sb1, sb2, sb3 = st.columns(3)
+        sb1.metric("ðŸŸ¢ Bullish",  len(bullish))
+        sb2.metric("ðŸ”´ Bearish",  len(bearish))
+        sb3.metric("ðŸŸ¡ Watch",    len(watching))
+        st.divider()
+
+        # Ranked table
+        st.markdown("### Ranked by Conviction (strongest first)")
+        for r in scan_results:
+            sig_icon = "ðŸŸ¢" if r["signal"] == "BUY CALL" else "ðŸ”´" if r["signal"] == "BUY PUT" else "ðŸŸ¡"
+            border   = "#4CAF50" if r["signal"] == "BUY CALL" else "#ef5350" if r["signal"] == "BUY PUT" else "#FF9800"
+
+            with st.expander("{} **{}** â€” {} (conviction: {:+.0f})".format(
+                    sig_icon, r["symbol"], r["signal"], r["conviction"]), expanded=False):
+
+                ec1, ec2, ec3, ec4 = st.columns(4)
+                ec1.metric("PCR",         "{:.2f}".format(r["pcr"]),
+                            delta=r["pcr_label"])
+                ec2.metric("CE OI Chg",   "{:+.1f}%".format(r["ce_oi_chg"]))
+                ec3.metric("PE OI Chg",   "{:+.1f}%".format(r["pe_oi_chg"]))
+                ec4.metric("Net OI Bias", "{:+.1f}".format(r["net_oi_bias"]),
+                            delta="Bullish" if r["net_oi_bias"] > 0 else "Bearish")
+
+                ec5, ec6, ec7 = st.columns(3)
+                ec5.metric("ATM IV",      "{:.1f}%".format(r["atm_iv"]))
+                ec6.metric("IV Rank",     "{:.0f}%".format(r["iv_rank"]),
+                            delta="Cheap buy" if r["iv_rank"] < 30 else "Sell IV" if r["iv_rank"] > 70 else "Fair")
+                ec7.metric("Vol Ratio",   "{:.1f}x".format(r["vol_ratio"]),
+                            delta="High volume" if r["vol_ratio"] > 1.5 else "Normal")
+
+                st.markdown("**Murphy OI Signal:** {} â€” {}".format(r["murphy_signal"], r["murphy_note"]))
+                st.caption("Natenberg: {}".format(r["iv_note"]))
+
+        st.divider()
+
+        # Heatmap of convictions
+        st.markdown("### Conviction Heatmap")
+        scan_df = pd.DataFrame([{
+            "Symbol":    r["symbol"],
+            "Signal":    r["signal"],
+            "Conviction":r["conviction"],
+            "PCR":       r["pcr"],
+            "CE OI Chg%":r["ce_oi_chg"],
+            "PE OI Chg%":r["pe_oi_chg"],
+            "IV Rank":   r["iv_rank"],
+            "Vol Ratio": r["vol_ratio"],
+            "Murphy":    r["murphy_signal"],
+        } for r in scan_results])
+
+        def _color_signal(val):
+            if val == "BUY CALL": return "background-color:#1a3a00;color:#4CAF50"
+            if val == "BUY PUT":  return "background-color:#3a0000;color:#ef5350"
+            return "background-color:#2a2a00;color:#FF9800"
+
+        def _color_conv(val):
+            if val > 40:  return "color:#4CAF50;font-weight:bold"
+            if val < -40: return "color:#ef5350;font-weight:bold"
+            return "color:#FF9800"
+
+        styled = (scan_df.style
+                  .map(_color_signal, subset=["Signal"])
+                  .map(_color_conv,   subset=["Conviction"])
+                  .format({"PCR": "{:.2f}", "CE OI Chg%": "{:+.1f}", "PE OI Chg%": "{:+.1f}",
+                            "IV Rank": "{:.0f}%", "Conviction": "{:+.0f}", "Vol Ratio": "{:.1f}x"}))
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "ðŸ“– Sources: Murphy J.J. (1999) Technical Analysis of Financial Markets Â· "
+            "Natenberg S. (2015) Option Volatility & Pricing Â· McMillan L.G. (2012) Options as a Strategic Investment"
+        )
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 3 â€” EXPIRY SIGNALS
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+with tab_exp:
+    st.markdown("## ðŸ“… Expiry Signals")
+
+    # Re-compute ATM IV for this tab
+    atm_iv_exp = 0.0
+    if not df.empty:
+        try:
+            idx_atm    = (df["strike"] - underlying).abs().idxmin()
+            atm_iv_exp = float(df.iloc[idx_atm]["ce_iv"])
+        except Exception:
+            pass
+    if atm_iv_exp == 0:
+        atm_iv_exp = 15.0
+
+    h_left_exp = ea.hours_to_expiry(expiry)
+
+    # â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if h_left_exp <= 0:
+        st.error("âš ï¸ Current expiry {} has passed. Showing analysis for reference.".format(expiry))
+    elif h_left_exp <= 6.5:
+        st.markdown(
+            '<div style="background:#2d0000;border:2px solid #ef5350;padding:15px;border-radius:12px;">'
+            '<h3 style="color:#ef5350;margin:0;">âš¡ EXPIRY DAY â€” {:.1f} market hours left</h3>'
+            '<p style="color:#ccc;margin:5px 0 0 0;">Augen (2009): Max Pain magnet effect strongest in last 2 hours. '
+            'Gamma spikes near ATM â€” scalp targets 30â€“80 points on NIFTY.</p>'
+            '</div>'.format(h_left_exp),
+            unsafe_allow_html=True
+        )
+    elif h_left_exp <= 24:
+        st.warning("â° Expiry **{}** is tomorrow. Check next expiry below.".format(expiry))
+    else:
+        st.info("Current expiry: **{}** â€” {:.1f} market hours remaining".format(expiry, h_left_exp))
+
+    st.divider()
+
+    # â”€â”€ Expiry day scalp signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    exp_col, next_col = st.columns(2)
+
+    with exp_col:
+        st.markdown("### Expiry Scalp Signal (Augen Framework)")
+        st.caption("Volume + OI change + Max Pain â€” 30â€“50 point targets")
+
+        exp_sig = ea.expiry_scalp_signal(df, meta, sig, atm_iv=atm_iv_exp)
+
+        sig_icon = "ðŸŸ¢" if exp_sig["direction"] == "BUY CALL" else \
+                   "ðŸ”´" if exp_sig["direction"] == "BUY PUT" else "ðŸŸ¡"
+        sig_bg   = {"BUY CALL": "#0a2a0a", "BUY PUT": "#2a0a0a"}.get(exp_sig["direction"], "#2a2a00")
+        sig_col_ = {"BUY CALL": "#4CAF50", "BUY PUT": "#ef5350"}.get(exp_sig["direction"], "#FF9800")
+
+        st.markdown(
+            '<div style="background:{};border:2px solid {};padding:20px;border-radius:12px;text-align:center;">'
+            '<div style="font-size:36px;">{}</div>'
+            '<div style="font-size:24px;font-weight:bold;color:{};">{}</div>'
+            '<div style="color:#ccc;margin-top:8px;">{}</div>'
+            '</div>'.format(sig_bg, sig_col_, sig_icon,
+                            sig_col_, exp_sig["direction"], exp_sig["action"]),
+            unsafe_allow_html=True
+        )
+
+        st.markdown("**Signal Checks:**")
+        for r in exp_sig["reasons"]:
+            st.markdown(r)
+
+        # Expected range
+        er = exp_sig["expected_range"]
+        st.markdown("---")
+        st.markdown("**Expected Range (Natenberg IV-based)**")
+        rc1, rc2, rc3 = st.columns(3)
+        rc1.metric("Upper", "â‚¹{:,.0f}".format(er["upper"]))
+        rc2.metric("Move Â±", "â‚¹{:,.0f}".format(er["move_pts"]))
+        rc3.metric("Lower", "â‚¹{:,.0f}".format(er["lower"]))
+
+        # Trade params
+        st.markdown("---")
+        st.markdown("**Expiry Scalp Parameters**")
+        prem = exp_sig["atm_premium_est"]
+        sl_p = round(prem * (1 - exp_sig["sl_pct"]), 1)
+        tg_p = round(prem * (1 + exp_sig["tgt_pct"]), 1)
+        st.dataframe(pd.DataFrame({
+            "Parameter": ["ATM Premium (est.)", "Stop-Loss (âˆ’30%)", "Target (+50%)",
+                          "Points Target", "Lot Size", "Best Hold"],
+            "Value":     ["â‚¹{:.1f}".format(prem),
+                          "â‚¹{:.1f}".format(sl_p),
+                          "â‚¹{:.1f}".format(tg_p),
+                          "Â±{} pts (NIFTY)".format(exp_sig["pts_target"]),
+                          "{} units".format(exp_sig["lot_size"]),
+                          "30â€“60 min or 3:15 PM"]
+        }), hide_index=True, use_container_width=True)
+
+    with next_col:
+        st.markdown("### Next Expiry Analysis")
+
+        all_exp = meta.get("all_expiries", [expiry])
+        nxt = ea.next_expiry_info(all_exp, expiry, underlying, atm_iv_exp)
+
+        if "error" in nxt:
+            st.info("Next expiry data not available (need â‰¥2 expiry dates in chain).")
+        else:
+            st.markdown("**Next Expiry: {}**".format(nxt["next_expiry"]))
+            st.markdown("{} trading days away Â· ATM IV for next: {}%".format(
+                nxt["days_to_next"], nxt["iv_for_next"]))
+
+            nr = nxt["expected_range"]
+            nc1, nc2, nc3 = st.columns(3)
+            nc1.metric("Upper", "â‚¹{:,.0f}".format(nr["upper"]))
+            nc2.metric("Move Â±", "â‚¹{:,.0f}".format(nr["move_pts"]))
+            nc3.metric("Lower", "â‚¹{:,.0f}".format(nr["lower"]))
+
+            st.markdown("---")
+            st.markdown("**Strategy Recommendation (Natenberg)**")
+            st.markdown(
+                '<div style="background:#1e1e2e;padding:15px;border-radius:10px;">'
+                '<b style="color:#26a69a;font-size:18px;">{}</b><br>'
+                '<span style="color:#ccc;">{}</span>'
+                '</div>'.format(nxt["strategy"], nxt["strategy_why"]),
+                unsafe_allow_html=True
+            )
+
+        st.markdown("---")
+
+        # Augen Gamma Zones
+        st.markdown("### Gamma Hot Zones (Augen)")
+        st.caption("Strikes where OI creates strongest magnet effect â€” expiry day key levels")
+        zones = ea.augen_gamma_zones(df, underlying, h_left_exp)
+        if zones:
+            z_df = pd.DataFrame(zones)[["strike","type","ce_oi","pe_oi","pull_score","dist_pts"]]
+            z_df.columns = ["Strike","Type","CE OI","PE OI","Pull Score","Dist (pts)"]
+            def _color_zone(val):
+                return "color:#ef5350" if "RESIST" in str(val) else "color:#26a69a"
+            st.dataframe(
+                z_df.style.map(_color_zone, subset=["Type"])
+                          .format({"CE OI": "{:,.0f}", "PE OI": "{:,.0f}", "Pull Score": "{:.1f}"}),
+                hide_index=True, use_container_width=True
+            )
+        else:
+            st.info("Load live option chain data to see gamma zones.")
+
+    st.divider()
+
+    # â”€â”€ Theory section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    st.markdown("### Expiry Day Trading Methodology")
+    with st.expander("ðŸ“– Augen (2009) â€” Expiry Day Framework", expanded=False):
+        st.markdown("""
+**From "Trading Options at Expiration" by Jeff Augen:**
+
+1. **Gamma Spike**: ATM options gain gamma exponentially on expiry day.
+   - A 0.5% move in the underlying can double/halve an ATM option's price
+   - Trade smaller size â€” premium moves are violent
+
+2. **Max Pain Magnet**: In last 2 hours, underlying gravitates toward Max Pain
+   - Below Max Pain â†’ call writers buy back â†’ price rises
+   - Above Max Pain â†’ put writers buy back â†’ price falls
+
+3. **Time-of-day patterns (NSE Expiry)**:
+   - 9:20â€“10:30 AM: Gap fills and initial direction established
+   - 12:00â€“1:30 PM: Lull â€” avoid trading, volume low
+   - 2:00â€“3:15 PM: Max Pain pull strongest â€” last hour most reliable
+
+4. **Target sizing for NIFTY**:
+   - 5 min expiry scalp: Â±15-25 pts
+   - 15 min expiry trade: Â±30-50 pts
+   - Full session: Â±60-100 pts
+   - Set tight SL (25-30% of premium) â€” gamma can reverse quickly
+
+5. **Strike selection on expiry day**:
+   - ATM = 0.5 delta = best for directional trades
+   - 1-OTM = cheaper but lower delta, harder to recover from wrong direction
+        """)
+
+    with st.expander("ðŸ“– Murphy (1999) â€” OI Analysis on Expiry", expanded=False):
+        st.markdown("""
+**From "Technical Analysis of Financial Markets" (Chapter 7 â€” Volume and OI):**
+
+| OI Change | Price Change | Interpretation | Action |
+|-----------|-------------|----------------|--------|
+| Rising OI + Rising Price | â†’ | Fresh longs entering = **Strong Bullish** | BUY CALL |
+| Rising OI + Falling Price | â†’ | Fresh shorts entering = **Strong Bearish** | BUY PUT |
+| Falling OI + Rising Price | â†’ | Short covering (weak move) = **Rally may fade** | CAUTION |
+| Falling OI + Falling Price | â†’ | Long liquidation (selling easing) = **Recovery near** | WATCH |
+
+On expiry day, **net OI flow near ATM** (within Â±2 strikes) is the key signal:
+- PE writers adding OI at support â†’ market expects to hold support â†’ BUY CALL
+- CE writers adding OI at resistance â†’ market expects to hold resistance â†’ BUY PUT
+        """)
+
+    st.caption("âš ï¸ Educational only â€” not financial advice. Options trading involves significant risk.")
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 4 â€” BACKTEST & MODEL TRAINING
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_bt:
     st.markdown("## Backtest & Model Training")
     st.markdown("Analyse historical signal accuracy and P&L using index OHLCV data.")
@@ -1200,7 +1060,7 @@ with tab_bt:
     with left_bt:
         bt_mode = st.radio(
             "Mode",
-            ["A — Signal Accuracy", "B — P&L Simulation", "C — Forward Tracker", "Train Model"],
+            ["A â€” Signal Accuracy", "B â€” P&L Simulation", "C â€” Forward Tracker", "Train Model"],
         )
         bt_days = st.slider("Historical Days", 20, 90, 30, step=5)
         if data_source == "Angel One (Live)":
@@ -1211,21 +1071,21 @@ with tab_bt:
     with right_bt:
         candles = _get_candles(symbol, is_index, bt_days, data_source)
 
-        # ── Mode A: Signal Accuracy ───────────────────────────────────────────
+        # â”€â”€ Mode A: Signal Accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if bt_mode.startswith("A"):
             st.markdown("### Signal Accuracy Backtest")
             st.markdown(
                 "Uses **RSI-14 + EMA-9/EMA-21 crossover + volume ratio** consensus "
-                "on {} daily candles. Signals fire only when 2+ indicators agree — "
+                "on {} daily candles. Signals fire only when 2+ indicators agree â€” "
                 "higher selectivity means fewer trades but better quality signals. "
                 "**Note:** Synthetic demo data is a random walk; near-50% win rate "
                 "on synthetic data is expected. Use Angel One for real results.".format(bt_days)
             )
             if st.button("Run Accuracy Backtest", type="primary", key="run_acc"):
-                with st.spinner("Running backtest…"):
+                with st.spinner("Running backtestâ€¦"):
                     metrics, rdf = backtest.run_accuracy_backtest(candles)
                 if not metrics:
-                    st.error("Not enough data (need ≥12 candles).")
+                    st.error("Not enough data (need â‰¥12 candles).")
                 else:
                     m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Win Rate",      "{}%".format(metrics["win_rate"]))
@@ -1260,63 +1120,63 @@ with tab_bt:
                     )
                     st.success("Today's signal auto-saved to Forward Tracker.")
 
-        # ── Mode B: P&L Simulation ────────────────────────────────────────────
+        # â”€â”€ Mode B: P&L Simulation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif bt_mode.startswith("B"):
-            st.markdown("### P&L Simulation (₹)")
+            st.markdown("### P&L Simulation (â‚¹)")
             st.markdown(
                 "Buys 1 lot ATM option at estimated premium (0.8% of index price). "
-                "Win = 1.5× premium, Loss = 0.4× premium (approximate)."
+                "Win = 1.5Ã— premium, Loss = 0.4Ã— premium (approximate)."
             )
             lot_defaults = {"NIFTY": 75, "BANKNIFTY": 30, "FINNIFTY": 40,
                             "MIDCPNIFTY": 50, "SENSEX": 20}
             sim_lot  = st.number_input("Lot Size", value=lot_defaults.get(symbol.upper(), 75),
                                         min_value=1, max_value=500)
-            sim_comm = st.number_input("Commission per trade (₹)", value=40,
+            sim_comm = st.number_input("Commission per trade (â‚¹)", value=40,
                                         min_value=0, max_value=500)
 
             if st.button("Run P&L Simulation", type="primary", key="run_pnl"):
-                with st.spinner("Simulating P&L…"):
+                with st.spinner("Simulating P&Lâ€¦"):
                     metrics, rdf = backtest.run_pnl_simulation(candles, int(sim_lot), int(sim_comm))
                 if not metrics:
-                    st.error("Not enough data (need ≥12 candles).")
+                    st.error("Not enough data (need â‰¥12 candles).")
                 else:
                     pnl_color = "#26a69a" if metrics["total_pnl"] >= 0 else "#ef5350"
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Total P&L", "₹{:,}".format(metrics["total_pnl"]),
+                    m1.metric("Total P&L", "â‚¹{:,}".format(metrics["total_pnl"]),
                                delta="Profit" if metrics["total_pnl"] >= 0 else "Loss")
                     m2.metric("Win Rate",   "{}%".format(metrics["win_rate"]))
-                    m3.metric("Max Drawdown", "₹{:,}".format(metrics["max_drawdown"]))
+                    m3.metric("Max Drawdown", "â‚¹{:,}".format(metrics["max_drawdown"]))
                     m4.metric("Sharpe",     str(metrics["sharpe_ratio"]))
 
                     m5, m6, m7 = st.columns(3)
-                    m5.metric("Best Trade",  "₹{:,}".format(metrics["best_trade"]))
-                    m6.metric("Worst Trade", "₹{:,}".format(metrics["worst_trade"]))
-                    m7.metric("Avg P&L",     "₹{:,}".format(int(metrics["avg_pnl"])))
+                    m5.metric("Best Trade",  "â‚¹{:,}".format(metrics["best_trade"]))
+                    m6.metric("Worst Trade", "â‚¹{:,}".format(metrics["worst_trade"]))
+                    m7.metric("Avg P&L",     "â‚¹{:,}".format(int(metrics["avg_pnl"])))
 
                     fig_pnl = go.Figure()
                     fig_pnl.add_trace(go.Scatter(
                         x=rdf["date"], y=rdf["equity"],
                         mode="lines", fill="tozeroy",
                         line=dict(color=pnl_color, width=2),
-                        name="Cumulative P&L (₹)"
+                        name="Cumulative P&L (â‚¹)"
                     ))
                     fig_pnl.update_layout(
                         title="Cumulative P&L Curve",
                         height=280,
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                         xaxis=dict(gridcolor="#333", tickangle=-45),
-                        yaxis=dict(title="₹", gridcolor="#333"),
+                        yaxis=dict(title="â‚¹", gridcolor="#333"),
                         margin=dict(t=40, b=30)
                     )
                     st.plotly_chart(fig_pnl, use_container_width=True)
                     st.dataframe(rdf[["date","close","signal","premium","pnl","result","equity"]],
                                  use_container_width=True, height=280)
 
-        # ── Mode C: Forward Tracker ───────────────────────────────────────────
+        # â”€â”€ Mode C: Forward Tracker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif bt_mode.startswith("C"):
             st.markdown("### Forward Paper Signal Tracker")
             st.markdown(
-                "Save today's signal → auto-checked against next trading day's close. "
+                "Save today's signal â†’ auto-checked against next trading day's close. "
                 "Builds a real-time accuracy log over time."
             )
 
@@ -1330,7 +1190,7 @@ with tab_bt:
                         symbol, sig["signal"], sig["confidence"],
                         underlying, float(pcr), float(max_pain)
                     )
-                    st.success("Saved: {} {} @ ₹{:,.0f}".format(
+                    st.success("Saved: {} {} @ â‚¹{:,.0f}".format(
                         sig["signal"], symbol, underlying))
                     st.rerun()
 
@@ -1344,7 +1204,7 @@ with tab_bt:
                         st.metric("Forward Accuracy", "{}%".format(acc),
                                    delta="{} signals tracked".format(total))
                     else:
-                        st.info("{} signals tracked — awaiting resolution".format(total))
+                        st.info("{} signals tracked â€” awaiting resolution".format(total))
                 else:
                     st.info("No signals tracked yet.")
 
@@ -1363,7 +1223,7 @@ with tab_bt:
             else:
                 st.info("Click **Save Today's Signal** above to begin tracking.")
 
-        # ── Mode: Train Model ─────────────────────────────────────────────────
+        # â”€â”€ Mode: Train Model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         else:
             st.markdown("### Model Weight Calibration")
             st.markdown(
@@ -1373,7 +1233,7 @@ with tab_bt:
             )
 
             if st.button("Run Grid Search (54 combinations)", type="primary", key="run_calib"):
-                with st.spinner("Calibrating — scanning 576 parameter combinations…"):
+                with st.spinner("Calibrating â€” scanning 576 parameter combinationsâ€¦"):
                     st.session_state["_calib"] = model_train.calibrate_weights(candles)
 
             calib = st.session_state.get("_calib")
@@ -1422,32 +1282,32 @@ with tab_bt:
             st.json(backtest.load_weights())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — PAPER TRADE
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 3 â€” PAPER TRADE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_pt:
     pt.init_portfolio(st.session_state)
     summary = pt.get_summary(st.session_state, df, underlying)
 
-    st.markdown("## Paper Trading  —  Virtual ₹1,00,000 Capital")
+    st.markdown("## Paper Trading  â€”  Virtual â‚¹1,00,000 Capital")
     st.caption("All trades are simulated. No real money involved. "
                "Trades persist within a session and are saved locally.")
 
     # Portfolio metrics
     pc1, pc2, pc3, pc4 = st.columns(4)
-    pc1.metric("Available Capital", "₹{:,.0f}".format(summary["capital"]))
+    pc1.metric("Available Capital", "â‚¹{:,.0f}".format(summary["capital"]))
     pc2.metric("Realised P&L",
-               "₹{:,.0f}".format(summary["realized_pnl"]),
+               "â‚¹{:,.0f}".format(summary["realized_pnl"]),
                delta="+" + str(summary["realized_pnl"]) if summary["realized_pnl"] >= 0
                      else str(summary["realized_pnl"]))
-    pc3.metric("Unrealised P&L",    "₹{:,.0f}".format(summary["unrealized_pnl"]))
+    pc3.metric("Unrealised P&L",    "â‚¹{:,.0f}".format(summary["unrealized_pnl"]))
     pc4.metric("Total Return",
                "{}%".format(summary["total_return_pct"]),
                delta="{:+,.0f}".format(summary["total_pnl"]))
 
     st.divider()
 
-    # ── Place Trade ───────────────────────────────────────────────────────────
+    # â”€â”€ Place Trade â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     st.markdown("### Place New Paper Trade")
 
     with st.form("place_trade_form"):
@@ -1457,7 +1317,7 @@ with tab_pt:
             pt_type = st.radio("Type", ["BUY CALL", "BUY PUT"])
         with fc2:
             def_strike = float(int(meta.get("atm", underlying) / 50) * 50)
-            pt_strike  = st.number_input("Strike Price ₹", value=def_strike,
+            pt_strike  = st.number_input("Strike Price â‚¹", value=def_strike,
                                           step=50.0, format="%.1f")
             pt_expiry  = st.text_input("Expiry", value=expiry)
         with fc3:
@@ -1468,7 +1328,7 @@ with tab_pt:
                 sugg = max(sugg, 1.0)
             else:
                 sugg = max(round(float(underlying) * 0.008, 2), 1.0)
-            pt_entry = st.number_input("Entry Premium ₹/unit", value=round(sugg, 2),
+            pt_entry = st.number_input("Entry Premium â‚¹/unit", value=round(sugg, 2),
                                         min_value=0.05, step=0.5, format="%.2f")
 
         if st.form_submit_button("Place Trade", type="primary", use_container_width=True):
@@ -1483,7 +1343,7 @@ with tab_pt:
 
     st.divider()
 
-    # ── Open Trades ───────────────────────────────────────────────────────────
+    # â”€â”€ Open Trades â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     open_trades = summary["open_trades"]
     st.markdown("### Open Trades ({})".format(len(open_trades)))
 
@@ -1495,8 +1355,8 @@ with tab_pt:
             "Strike":   t["strike"],
             "Expiry":   t["expiry"],
             "Lots":     t["lots"],
-            "Entry ₹":  t["entry_price"],
-            "Cost ₹":   round(t["entry_price"] * t["lots"] * t["lot_size"], 2),
+            "Entry â‚¹":  t["entry_price"],
+            "Cost â‚¹":   round(t["entry_price"] * t["lots"] * t["lot_size"], 2),
             "Opened":   t["entry_time"],
         } for t in open_trades])
         st.dataframe(open_df, use_container_width=True, hide_index=True)
@@ -1513,7 +1373,7 @@ with tab_pt:
                 close_sel = st.selectbox("Select Trade", trade_labels)
                 close_tid = trade_ids[trade_labels.index(close_sel)]
             with cl2:
-                close_exit = st.number_input("Exit Premium ₹/unit", value=1.0,
+                close_exit = st.number_input("Exit Premium â‚¹/unit", value=1.0,
                                               min_value=0.05, step=0.5, format="%.2f")
             if st.form_submit_button("Close Trade", type="primary", use_container_width=True):
                 ok, msg = pt.close_trade(st.session_state, close_tid, float(close_exit))
@@ -1525,7 +1385,7 @@ with tab_pt:
     else:
         st.info("No open trades. Place a trade above.")
 
-    # ── Closed Trades ─────────────────────────────────────────────────────────
+    # â”€â”€ Closed Trades â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     closed_trades = summary["closed_trades"]
     st.markdown("### Closed Trades ({})".format(len(closed_trades)))
 
@@ -1536,9 +1396,9 @@ with tab_pt:
             "Type":    t["type"],
             "Strike":  t["strike"],
             "Lots":    t["lots"],
-            "Entry ₹": t["entry_price"],
-            "Exit ₹":  t["exit_price"],
-            "P&L ₹":   t["pnl"],
+            "Entry â‚¹": t["entry_price"],
+            "Exit â‚¹":  t["exit_price"],
+            "P&L â‚¹":   t["pnl"],
             "Exited":  t["exit_time"],
         } for t in closed_trades])
 
@@ -1548,7 +1408,7 @@ with tab_pt:
             return "color: #888"
 
         st.dataframe(
-            closed_df.style.map(_pnl_color, subset=["P&L ₹"]),
+            closed_df.style.map(_pnl_color, subset=["P&L â‚¹"]),
             use_container_width=True, hide_index=True
         )
 
@@ -1563,14 +1423,14 @@ with tab_pt:
     else:
         st.info("No closed trades yet.")
 
-    # ── Reset ─────────────────────────────────────────────────────────────────
+    # â”€â”€ Reset â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     st.divider()
     st.markdown("### Reset Portfolio")
     if "pt_confirm_reset" not in st.session_state:
         st.session_state.pt_confirm_reset = False
 
     if not st.session_state.pt_confirm_reset:
-        if st.button("Reset Portfolio to ₹1,00,000", type="secondary"):
+        if st.button("Reset Portfolio to â‚¹1,00,000", type="secondary"):
             st.session_state.pt_confirm_reset = True
             st.rerun()
     else:
@@ -1579,20 +1439,20 @@ with tab_pt:
         if yes_col.button("Yes, Reset Everything", type="primary"):
             pt.reset_portfolio(st.session_state)
             st.session_state.pt_confirm_reset = False
-            st.success("Portfolio reset to ₹1,00,000!")
+            st.success("Portfolio reset to â‚¹1,00,000!")
             st.rerun()
         if no_col.button("Cancel"):
             st.session_state.pt_confirm_reset = False
             st.rerun()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — CHAT
-# ═════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# TAB 4 â€” CHAT
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_chat:
     st.markdown("## Chat with the Data")
     st.markdown(
-        "Discuss the trade before you place it — ask for a **Trade Decision** or run "
+        "Discuss the trade before you place it â€” ask for a **Trade Decision** or run "
         "the **Scalping Checklist**, then drill into any detail."
     )
 
@@ -1604,12 +1464,12 @@ with tab_chat:
     if _api_key_present:
         st.success("Claude AI (claude-haiku-4-5-20251001) enabled")
     else:
-        st.info("Keyword mode active — add `anthropic_api_key` to Streamlit secrets for AI answers")
+        st.info("Keyword mode active â€” add `anthropic_api_key` to Streamlit secrets for AI answers")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    # ── Timeframe selector ────────────────────────────────────────────────────
+    # â”€â”€ Timeframe selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     st.markdown("#### Select Timeframe")
     tf_options = {
         "5-min":  "5-min Scalp",
@@ -1630,20 +1490,20 @@ with tab_chat:
     )
 
     tf_info = {
-        "5-min":  "10-15 min hold · SL 20% · Target 30% · Best: 9:20-10:00 AM",
-        "15-min": "45-60 min hold · SL 30% · Target 50% · Best: 9:30-11:30 AM",
-        "30-min": "1.5-2 hr hold  · SL 35% · Target 60% · Best: 9:45 AM-12:00 PM",
-        "1-hr":   "2-3 hr hold    · SL 40% · Target 65% · Best: 9:30-11:30 AM",
-        "2-hr":   "1-day hold     · SL 45% · Target 80% · Use credit spreads",
-        "daily":  "2-3 day hold   · SL 50% · Target 100% · Use next-week expiry",
+        "5-min":  "10-15 min hold Â· SL 20% Â· Target 30% Â· Best: 9:20-10:00 AM",
+        "15-min": "45-60 min hold Â· SL 30% Â· Target 50% Â· Best: 9:30-11:30 AM",
+        "30-min": "1.5-2 hr hold  Â· SL 35% Â· Target 60% Â· Best: 9:45 AM-12:00 PM",
+        "1-hr":   "2-3 hr hold    Â· SL 40% Â· Target 65% Â· Best: 9:30-11:30 AM",
+        "2-hr":   "1-day hold     Â· SL 45% Â· Target 80% Â· Use credit spreads",
+        "daily":  "2-3 day hold   Â· SL 50% Â· Target 100% Â· Use next-week expiry",
     }
-    st.caption("⏱ " + tf_info[selected_tf])
+    st.caption("â± " + tf_info[selected_tf])
 
-    # ── Primary action buttons ────────────────────────────────────────────────
+    # â”€â”€ Primary action buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     st.markdown("#### Start here:")
     pa1, pa2 = st.columns(2)
     if pa1.button(
-        "🎯 Get Trade Decision",
+        "ðŸŽ¯ Get Trade Decision",
         use_container_width=True,
         type="primary",
         key="pa_decision",
@@ -1655,7 +1515,7 @@ with tab_chat:
         st.session_state.chat_history.append({"role": "assistant", "content": a})
         st.rerun()
 
-    checklist_label = "📋 {} Checklist".format(tf_options[selected_tf])
+    checklist_label = "ðŸ“‹ {} Checklist".format(tf_options[selected_tf])
     if pa2.button(
         checklist_label,
         use_container_width=True,
@@ -1671,20 +1531,20 @@ with tab_chat:
 
     st.divider()
 
-    # ── Chat history ──────────────────────────────────────────────────────────
+    # â”€â”€ Chat history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
     user_input = st.chat_input(
-        "Ask: trade decision · checklist · signal · pcr · IV · tomorrow · help"
+        "Ask: trade decision Â· checklist Â· signal Â· pcr Â· IV Â· tomorrow Â· help"
     )
     if user_input:
         st.session_state.chat_history.append({"role": "user", "content": user_input})
         with st.chat_message("user"):
             st.markdown(user_input)
         with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
+            with st.spinner("Thinkingâ€¦"):
                 answer = chat_bot.answer(user_input, df, meta, sig,
                                          timeframe=selected_tf)
             st.markdown(answer)
@@ -1713,244 +1573,7 @@ with tab_chat:
         st.rerun()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 5 — INDEX ANALYSIS  (VWAP · EMA9/20 · RSI · PVT · Net Volume)
-# ═════════════════════════════════════════════════════════════════════════════
-with tab_idx:
-    from plotly.subplots import make_subplots
-
-    st.markdown("## 🇮🇳 Indian Index Technical Analysis")
-    st.caption(
-        "VWAP · EMA-9 · EMA-20 · RSI-14 · PVT · Net Volume  |  "
-        "Data: Angel One (live) → yfinance (fallback) → Demo"
-    )
-
-    # ── Controls ──────────────────────────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
-    with ctrl1:
-        idx_opts      = ["{} — {}".format(k, v) for k, v in INDICES.items()]
-        idx_sel       = st.selectbox("Select Index", idx_opts, key="ia_idx")
-        ia_symbol     = idx_sel.split(" — ")[0]
-    with ctrl2:
-        ia_days = st.slider("History (days)", 15, 90, 30, step=5, key="ia_days")
-    with ctrl3:
-        ia_fno_note = "✅ F&O index" if ia_symbol in FNO_INDICES else "ℹ️ Spot-only index"
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.info(ia_fno_note)
-
-    # ── Fetch & compute ───────────────────────────────────────────────────────
-    with st.spinner("Fetching {} candles…".format(ia_symbol)):
-        ia_candles = _get_candles(ia_symbol, True, ia_days, data_source)
-
-    if ia_candles is None or ia_candles.empty:
-        st.warning("No candle data available for {}. Try switching to Angel One.".format(ia_symbol))
-    else:
-        ia_tech = compute_technicals(ia_candles)
-        sig_str, sig_col, sig_score, sig_reasons = tech_signal(ia_tech)
-        latest  = ia_tech.iloc[-1]
-        prev    = ia_tech.iloc[-2] if len(ia_tech) > 1 else latest
-        chg_pct = (latest["close"] - prev["close"]) / prev["close"] * 100
-
-        # ── Signal header ─────────────────────────────────────────────────────
-        h1, h2, h3, h4, h5, h6 = st.columns(6)
-        h1.metric("Spot", "₹{:,.2f}".format(latest["close"]),
-                  delta="{:+.2f}%".format(chg_pct))
-        h2.metric("VWAP",  "₹{:,.2f}".format(latest["vwap"]))
-        h3.metric("EMA 9", "₹{:,.2f}".format(latest["ema9"]))
-        h4.metric("EMA 20","₹{:,.2f}".format(latest["ema20"]))
-        h5.metric("RSI 14","{:.1f}".format(latest["rsi"]),
-                  delta="Overbought" if latest["rsi"] > 70 else
-                        ("Oversold" if latest["rsi"] < 30 else "Neutral"))
-        h6.metric("Signal", sig_str)
-
-        st.divider()
-
-        # ── 4-panel technical chart ───────────────────────────────────────────
-        fig_tech = make_subplots(
-            rows=4, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.50, 0.18, 0.16, 0.16],
-            vertical_spacing=0.03,
-            subplot_titles=[
-                "{} — Candles · VWAP · EMA9 · EMA20".format(ia_symbol),
-                "RSI 14",
-                "PVT (Price Volume Trend)",
-                "Net Volume",
-            ],
-        )
-
-        x = ia_tech["datetime"].astype(str)
-
-        # — Panel 1: Candlestick + indicators —
-        fig_tech.add_trace(go.Candlestick(
-            x=x,
-            open=ia_tech["open"], high=ia_tech["high"],
-            low=ia_tech["low"],  close=ia_tech["close"],
-            name="OHLC",
-            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-        ), row=1, col=1)
-        fig_tech.add_trace(go.Scatter(
-            x=x, y=ia_tech["vwap"], name="VWAP",
-            line=dict(color="#FF6F00", width=2, dash="dot"),
-        ), row=1, col=1)
-        fig_tech.add_trace(go.Scatter(
-            x=x, y=ia_tech["ema9"], name="EMA 9",
-            line=dict(color="#42A5F5", width=1.5),
-        ), row=1, col=1)
-        fig_tech.add_trace(go.Scatter(
-            x=x, y=ia_tech["ema20"], name="EMA 20",
-            line=dict(color="#FFA726", width=1.5),
-        ), row=1, col=1)
-
-        # — Panel 2: RSI —
-        fig_tech.add_trace(go.Scatter(
-            x=x, y=ia_tech["rsi"], name="RSI 14",
-            line=dict(color="#CE93D8", width=1.5),
-            fill="tozeroy", fillcolor="rgba(206,147,216,0.08)",
-        ), row=2, col=1)
-        for level, lcolor in [(70, "#ef5350"), (50, "#888"), (30, "#26a69a")]:
-            fig_tech.add_hline(y=level, line_dash="dash", line_color=lcolor,
-                               line_width=1, row=2, col=1)
-
-        # — Panel 3: PVT —
-        pvt_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in ia_tech["pvt"]]
-        fig_tech.add_trace(go.Bar(
-            x=x, y=ia_tech["pvt"], name="PVT",
-            marker_color=pvt_colors, opacity=0.85,
-        ), row=3, col=1)
-
-        # — Panel 4: Net Volume —
-        nv_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in ia_tech["net_vol"]]
-        fig_tech.add_trace(go.Bar(
-            x=x, y=ia_tech["net_vol"], name="Net Vol",
-            marker_color=nv_colors, opacity=0.85,
-        ), row=4, col=1)
-
-        fig_tech.update_layout(
-            height=820,
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=60, b=20, l=60, r=20),
-            legend=dict(orientation="h", y=1.04, x=0),
-            xaxis_rangeslider_visible=False,
-            font=dict(size=11),
-        )
-        for i in range(1, 5):
-            fig_tech.update_xaxes(gridcolor="#333", row=i, col=1)
-            fig_tech.update_yaxes(gridcolor="#333", row=i, col=1)
-
-        st.plotly_chart(fig_tech, use_container_width=True)
-
-        # ── Signal breakdown ──────────────────────────────────────────────────
-        st.divider()
-        sc1, sc2 = st.columns([1, 2])
-        with sc1:
-            bg_map  = {"green":"#1a7a1a","#8BC34A":"#2a4a10","orange":"#7a5c00",
-                       "#ef5350":"#5a1010","red":"#4a0808"}
-            brd_map = {"green":"#4CAF50","#8BC34A":"#8BC34A","orange":"#FF9800",
-                       "#ef5350":"#ef5350","red":"#f44336"}
-            bg  = bg_map.get(sig_col, "#333")
-            brd = brd_map.get(sig_col, "#888")
-            st.markdown(
-                '<div style="background:{};border:3px solid {};padding:24px;'
-                'border-radius:14px;text-align:center;">'
-                '<div style="font-size:13px;color:#ccc;">TECHNICAL SIGNAL</div>'
-                '<div style="font-size:26px;font-weight:bold;color:{};margin:8px 0;">{}</div>'
-                '<div style="font-size:14px;color:#ddd;">Score: {:+d} / 5</div>'
-                '</div>'.format(bg, brd, brd, sig_str, sig_score),
-                unsafe_allow_html=True,
-            )
-        with sc2:
-            st.markdown("#### Indicator Breakdown")
-            for r in sig_reasons:
-                st.markdown(r)
-
-        # ── Index Overview table ──────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 📋 All-Index Overview")
-        st.caption("Fetches last 30 days for each index. May take a few seconds.")
-
-        if st.button("Load All-Index Snapshot", key="ia_overview_btn"):
-            rows = []
-            prog = st.progress(0)
-            idx_list = list(INDICES.items())
-            for i, (sym, name) in enumerate(idx_list):
-                prog.progress((i + 1) / len(idx_list), text=sym)
-                try:
-                    c = _get_candles(sym, True, 30, data_source)
-                    if c is not None and not c.empty:
-                        td = compute_technicals(c)
-                        s, sc, ss, _ = tech_signal(td)
-                        lat = td.iloc[-1]
-                        prv = td.iloc[-2] if len(td) > 1 else lat
-                        chg = (lat["close"] - prv["close"]) / prv["close"] * 100
-                        rows.append({
-                            "Symbol": sym,
-                            "Name":   name,
-                            "Spot ₹": round(lat["close"], 2),
-                            "Chg %":  round(chg, 2),
-                            "EMA9":   round(lat["ema9"], 2),
-                            "EMA20":  round(lat["ema20"], 2),
-                            "VWAP":   round(lat["vwap"], 2),
-                            "RSI":    round(lat["rsi"], 1),
-                            "Signal": s,
-                            "Score":  ss,
-                            "F&O":    "✅" if sym in FNO_INDICES else "",
-                        })
-                except Exception:
-                    pass
-            prog.empty()
-
-            if rows:
-                ov_df = pd.DataFrame(rows)
-
-                def _sig_color(val):
-                    if "BULLISH" in val:  return "color:#26a69a;font-weight:bold"
-                    if "BEARISH" in val:  return "color:#ef5350;font-weight:bold"
-                    return "color:#FF9800"
-
-                def _chg_color(val):
-                    return "color:#26a69a" if val >= 0 else "color:#ef5350"
-
-                st.dataframe(
-                    ov_df.style
-                        .map(_sig_color, subset=["Signal"])
-                        .map(_chg_color, subset=["Chg %"])
-                        .format({"Spot ₹": "{:,.2f}", "EMA9": "{:,.2f}",
-                                 "EMA20": "{:,.2f}", "VWAP": "{:,.2f}",
-                                 "RSI": "{:.1f}", "Chg %": "{:+.2f}%"}),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=560,
-                )
-
-                # Quick bar chart — RSI across indices
-                fig_rsi = go.Figure(go.Bar(
-                    x=ov_df["Symbol"],
-                    y=ov_df["RSI"],
-                    marker_color=[
-                        "#ef5350" if v > 70 else "#26a69a" if v < 30 else "#42A5F5"
-                        for v in ov_df["RSI"]
-                    ],
-                    name="RSI 14",
-                ))
-                fig_rsi.add_hline(y=70, line_dash="dash", line_color="#ef5350", line_width=1)
-                fig_rsi.add_hline(y=30, line_dash="dash", line_color="#26a69a", line_width=1)
-                fig_rsi.add_hline(y=50, line_dash="dot",  line_color="#888",    line_width=1)
-                fig_rsi.update_layout(
-                    title="RSI 14 Across All Indian Indices",
-                    height=320,
-                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                    xaxis=dict(gridcolor="#333", tickangle=-45),
-                    yaxis=dict(gridcolor="#333", range=[0, 100]),
-                    margin=dict(t=40, b=60),
-                )
-                st.plotly_chart(fig_rsi, use_container_width=True)
-            else:
-                st.warning("Could not fetch data for any index. Check data source.")
-
-
-# ── Auto Refresh ──────────────────────────────────────────────────────────────
+# â”€â”€ Auto Refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 if auto_refresh:
     time.sleep(refresh_interval)
     st.cache_data.clear()
