@@ -897,25 +897,56 @@ def _build_context(df: pd.DataFrame, meta: dict, sig: dict) -> str:
     top_ce = _top_oi_strikes(df, "ce_oi", 3)
     top_pe = _top_oi_strikes(df, "pe_oi", 3)
 
+    # Near-ATM OI change for context
+    near_ce_chg = near_pe_chg = 0.0
+    if not df.empty:
+        try:
+            _idx = int((df["strike"] - underlying).abs().idxmin())
+            _near = df.iloc[max(0, _idx - 2):min(len(df), _idx + 3)]
+            near_ce_chg = float(_near["ce_chg_oi"].sum())
+            near_pe_chg = float(_near["pe_chg_oi"].sum())
+        except Exception:
+            pass
+
+    total_ce_chg = float(df["ce_chg_oi"].sum()) if not df.empty else 0.0
+    total_pe_chg = float(df["pe_chg_oi"].sum()) if not df.empty else 0.0
+    net_oi_flow  = total_pe_chg - total_ce_chg
+    iv_skew      = pe_iv - ce_iv
+
     ctx_lines = [
         "=== NSE OPTIONS LIVE DATA ===",
-        "Symbol: {}  Expiry: {}  Spot: {}  ATM: {}".format(
-            meta.get("symbol", "NIFTY"), expiry,
-            _fmt(underlying), _fmt(atm, 0)
+        "Symbol: {}  Expiry: {}  Spot: Rs.{}  ATM: Rs.{}".format(
+            meta.get("symbol", "NIFTY"), expiry, _fmt(underlying), _fmt(atm, 0)
         ),
-        "Signal: {} | Confidence: {}% | Score: {}".format(signal, int(confidence), int(score)),
-        "PCR: {} | MaxPain: {} | CE_Res: {} | PE_Sup: {}".format(
-            _fmt(pcr), _fmt(max_pain, 0), _fmt(ce_res, 0), _fmt(pe_sup, 0)
+        "SIGNAL: {} | Confidence: {}% | Score: {}".format(signal, int(confidence), int(score)),
+        "PCR: {} ({}) | MaxPain: Rs.{} ({}) | CE_Res: Rs.{} | PE_Sup: Rs.{}".format(
+            _fmt(pcr),
+            "BULLISH" if pcr > 1.2 else "BEARISH" if pcr < 0.8 else "NEUTRAL",
+            _fmt(max_pain, 0),
+            "Rs.{:,.0f} ABOVE spot".format(max_pain - underlying) if max_pain > underlying
+                else "Rs.{:,.0f} BELOW spot".format(underlying - max_pain),
+            _fmt(ce_res, 0), _fmt(pe_sup, 0)
         ),
-        "ATM IV — CE: {:.1f}% PE: {:.1f}%  |  ATM LTP — CE: ₹{:.1f} PE: ₹{:.1f}".format(
-            ce_iv, pe_iv, ce_ltp, pe_ltp
+        "ATM IV: CE {:.1f}% | PE {:.1f}% | Skew (PE-CE): {:+.1f}% | ATM LTP: CE Rs.{:.1f} PE Rs.{:.1f}".format(
+            ce_iv, pe_iv, iv_skew, ce_ltp, pe_ltp
         ),
-        "Reasons: " + "; ".join(reasons),
-        "Top CE OI strikes: " + ", ".join(
-            "₹{}={:,.0f}".format(int(s), o) for s, o in top_ce
+        "OI Flow total: CE chg {:+,.0f} | PE chg {:+,.0f} | Net {:+,.0f} ({})".format(
+            total_ce_chg, total_pe_chg, net_oi_flow,
+            "PE building BULLISH" if net_oi_flow > 0 else "CE building BEARISH"
         ),
-        "Top PE OI strikes: " + ", ".join(
-            "₹{}={:,.0f}".format(int(s), o) for s, o in top_pe
+        "OI Flow near ATM: CE {:+,.0f} | PE {:+,.0f} | {}".format(
+            near_ce_chg, near_pe_chg,
+            "PE writing at ATM (bullish)" if near_pe_chg > near_ce_chg else "CE writing at ATM (bearish)"
+        ),
+        "Signal reasons: " + "; ".join(reasons),
+        "Top CE OI (resistance): " + ", ".join(
+            "Rs.{}={:,.0f}".format(int(s), o) for s, o in top_ce
+        ),
+        "Top PE OI (support): " + ", ".join(
+            "Rs.{}={:,.0f}".format(int(s), o) for s, o in top_pe
+        ),
+        "Strategy: {} | {}".format(
+            sig.get("strategy_type", ""), sig.get("strategy_note", "")
         ),
     ]
     return "\n".join(ctx_lines)
@@ -937,21 +968,26 @@ def _claude_answer(
 
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=600,
+            max_tokens=1500,
             system=(
-                "You are an NSE options markets expert assistant. "
-                "Answer questions using only the provided option chain data context. "
-                "Be concise, factual and educational. "
-                "For trade decision / entry questions, give a clear BUY CALL / BUY PUT / AVOID "
-                "recommendation with entry, stop-loss, and target levels. "
-                "For scalping / intraday questions, provide a structured checklist. "
-                "Always remind the user this is for educational purposes only and not financial advice. "
-                "Use ₹ symbol for Indian Rupees."
+                "You are an expert NSE options markets analyst. "
+                "Use ONLY the provided live option chain data to answer questions — do not guess or use generic answers. "
+                "Always cite the specific numbers from the data (PCR, Max Pain, OI levels, IV%). "
+                "For trade decision / entry questions: give a clear BUY CALL / BUY PUT / AVOID verdict, "
+                "state the specific entry strike, estimated premium, stop-loss (Rs. value), and target (Rs. value). "
+                "For checklist questions: list each check with PASS/FAIL based on actual data values. "
+                "For OI / PCR / IV questions: explain what the specific number means for this instrument today. "
+                "For prediction questions: use PCR, Max Pain distance from spot, and OI buildup to forecast direction. "
+                "Be detailed — the user wants analysis, not one-liners. "
+                "Minimum 5-8 lines of analysis for any trade-related question. "
+                "Use Rs. for Indian Rupees (not the symbol). "
+                "End every response with a one-line bottom-line recommendation. "
+                "Always add: 'Educational purposes only - not financial advice.'"
             ),
             messages=[
                 {
                     "role": "user",
-                    "content": "Option chain context:\n{}\n\nQuestion: {}".format(
+                    "content": "Live NSE option chain data:\n{}\n\nQuestion: {}".format(
                         context, query
                     ),
                 }
