@@ -746,7 +746,7 @@ with tab_live:
         return "color: #FF9800"
 
     st.dataframe(
-        _hist_df.style.applymap(_color_hist_trend, subset=["Trend"]),
+        _hist_df.style.map(_color_hist_trend, subset=["Trend"]),
         hide_index=True, use_container_width=True
     )
     st.caption(
@@ -1039,8 +1039,8 @@ with tab_scan:
             return "color:#FF9800"
 
         styled = (scan_df.style
-                  .applymap(_color_signal, subset=["Signal"])
-                  .applymap(_color_conv,   subset=["Conviction"])
+                  .map(_color_signal, subset=["Signal"])
+                  .map(_color_conv,   subset=["Conviction"])
                   .format({"PCR": "{:.2f}", "CE OI Chg%": "{:+.1f}", "PE OI Chg%": "{:+.1f}",
                             "IV Rank": "{:.0f}%", "Conviction": "{:+.0f}", "Vol Ratio": "{:.1f}x"}))
         st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -1177,7 +1177,7 @@ with tab_exp:
             def _color_zone(val):
                 return "color:#ef5350" if "RESIST" in str(val) else "color:#26a69a"
             st.dataframe(
-                z_df.style.applymap(_color_zone, subset=["Type"])
+                z_df.style.map(_color_zone, subset=["Type"])
                           .format({"CE OI": "{:,.0f}", "PE OI": "{:,.0f}", "Pull Score": "{:.1f}"}),
                 hide_index=True, use_container_width=True
             )
@@ -1400,7 +1400,7 @@ with tab_bt:
                     return "color: #FF9800"
 
                 st.dataframe(
-                    fdf.style.applymap(_oc, subset=["outcome"]),
+                    fdf.style.map(_oc, subset=["outcome"]),
                     use_container_width=True, height=350
                 )
             else:
@@ -1586,7 +1586,7 @@ with tab_pt:
             return "color: #888"
 
         st.dataframe(
-            closed_df.style.applymap(_pnl_color, subset=["P&L Rs."]),
+            closed_df.style.map(_pnl_color, subset=["P&L Rs."]),
             use_container_width=True, hide_index=True
         )
 
