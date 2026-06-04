@@ -316,6 +316,12 @@ with tab_live:
     st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
     st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
         underlying, meta["atm"], source_tag))
+
+    # ── Fetch intraday candles once — reused by Tech Indicators + Smart Analysis ──
+    with st.spinner("Loading 15-min intraday data..."):
+        _intra_raw = _get_intraday(symbol, "15min", data_source)
+        _intra_t   = _compute_tech(_intra_raw) if not _intra_raw.empty else pd.DataFrame()
+
     st.divider()
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -603,8 +609,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
 
     with st.spinner("Running multi-framework analysis…"):
         _daily_c   = _get_candles(symbol, is_index, 40, data_source)
-        _intra_raw = _get_intraday(symbol, "15min", data_source)
-        _intra_t   = _compute_tech(_intra_raw) if not _intra_raw.empty else pd.DataFrame()
+        # _intra_t already fetched at top of tab_live
         _dte_val   = max(0, int(ea.hours_to_expiry(expiry) / 6.25))
         _sig_ext   = {**sig, "underlying_proxy": underlying}
 
