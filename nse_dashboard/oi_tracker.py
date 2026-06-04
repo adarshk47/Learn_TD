@@ -21,9 +21,22 @@ Plain-language interpretations (in English):
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 _SNAP_FILE = os.path.join(os.path.dirname(__file__), ".oi_snapshots.json")
+
+# Indian Standard Time = UTC+5:30
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_ist() -> datetime:
+    """Return current datetime in IST (naive, for display and comparison)."""
+    return datetime.now(_IST).replace(tzinfo=None)
+
+
+def _ist_str(dt: datetime) -> str:
+    """Format a datetime as IST HH:MM string."""
+    return dt.strftime("%H:%M IST")
 
 # Time windows to display (label, seconds_back)
 WINDOWS = [
@@ -59,7 +72,7 @@ def _save(snaps: list) -> None:
 
 
 def _prune(snaps: list) -> list:
-    cutoff = (datetime.now() - timedelta(hours=MAX_AGE_HOURS)).isoformat()
+    cutoff = (_now_ist() - timedelta(hours=MAX_AGE_HOURS)).isoformat()
     return [s for s in snaps if s.get("ts", "") >= cutoff]
 
 
@@ -85,7 +98,7 @@ def record_snapshot(df, underlying: float, pcr: float, call_sum_atm: float,
     pe_total = float(df["pe_oi"].sum())
 
     snap = {
-        "ts":           datetime.now().isoformat(timespec="seconds"),
+        "ts":           _now_ist().isoformat(timespec="seconds"),
         "symbol":       symbol,
         "underlying":   round(underlying, 2),
         "pcr":          round(pcr, 3),
@@ -111,43 +124,60 @@ def get_trend_table(symbol: str, current: dict) -> list[dict]:
     # Only this symbol
     snaps = [s for s in snaps if s.get("symbol", "") == symbol]
 
-    now = datetime.now()
+    now  = _now_ist()
     rows = []
 
+    # All past snapshots (exclude snaps taken in the future, i.e. > now+5s)
+    past_snaps = [s for s in snaps if datetime.fromisoformat(s["ts"]) <= now + timedelta(seconds=5)]
+
+    # Earliest snapshot time — tells the user when tracking began
+    first_ts = datetime.fromisoformat(past_snaps[0]["ts"]) if past_snaps else None
+    age_of_oldest = (now - first_ts).total_seconds() if first_ts else 0
+
     for label, secs_back in WINDOWS:
-        target_dt  = now - timedelta(seconds=secs_back)
-        # Find the snapshot closest to target_dt
-        candidates = [s for s in snaps if datetime.fromisoformat(s["ts"]) <= now]
-        if not candidates:
+        target_dt = now - timedelta(seconds=secs_back)
+
+        if not past_snaps:
             rows.append({
                 "window": label, "has_data": False,
-                "snap_time": None, "age_str": "No history yet",
-                "ce_chg": None, "pe_chg": None,
-                "net_flow": None, "pcr_chg": None,
-                "ce_chg_pct": None, "pe_chg_pct": None,
-                "trend": "Wait", "interpretation": "Collecting data — refresh every 30s",
+                "snap_time": "--",
+                "age_str": "No snapshots yet — refresh the page once",
+                "ce_chg": None, "pe_chg": None, "net_flow": None,
+                "pcr_chg": None, "ce_chg_pct": None, "pe_chg_pct": None,
+                "trend": "Wait",
+                "interpretation": "First refresh saves the first snapshot. Come back after {}."
+                                  .format(label),
                 "spot_then": None, "spot_chg": None,
             })
             continue
 
-        # Nearest snapshot to target time
-        snap = min(candidates,
-                   key=lambda s: abs((datetime.fromisoformat(s["ts"]) - target_dt).total_seconds()))
-        snap_dt  = datetime.fromisoformat(snap["ts"])
-        age_secs = (now - snap_dt).total_seconds()
-
-        # If the nearest snapshot is more than 2× the window away, no useful data
-        if age_secs < 30:
+        # Do we have any snapshot old enough for this window?
+        if age_of_oldest < secs_back - 30:
+            # Not enough history yet — tell user when data will be ready
+            need_more_secs = int(secs_back - age_of_oldest)
+            need_more_min  = need_more_secs // 60
+            ready_at_ist   = now + timedelta(seconds=need_more_secs)
             rows.append({
                 "window": label, "has_data": False,
-                "snap_time": snap_dt.strftime("%H:%M"),
-                "age_str":  "Just started ({:.0f}s ago)".format(age_secs),
-                "ce_chg": 0, "pe_chg": 0, "net_flow": 0, "pcr_chg": 0,
-                "ce_chg_pct": 0, "pe_chg_pct": 0,
-                "trend": "Wait", "interpretation": "Need more time to compute changes",
-                "spot_then": snap.get("underlying"), "spot_chg": 0,
+                "snap_time": _ist_str(first_ts) if first_ts else "--",
+                "age_str": "Tracking since {} IST ({:.0f} min ago)".format(
+                    first_ts.strftime("%H:%M"), age_of_oldest / 60) if first_ts else "--",
+                "ce_chg": None, "pe_chg": None, "net_flow": None,
+                "pcr_chg": None, "ce_chg_pct": None, "pe_chg_pct": None,
+                "trend": "Collecting",
+                "interpretation": "Data ready at {} IST (in ~{} min)".format(
+                    _ist_str(ready_at_ist), need_more_min),
+                "spot_then": None, "spot_chg": None,
             })
             continue
+
+        # Find snapshot closest to target_dt (from the past only)
+        past_candidates = [s for s in past_snaps
+                           if datetime.fromisoformat(s["ts"]) <= now]
+        snap    = min(past_candidates,
+                      key=lambda s: abs((datetime.fromisoformat(s["ts"]) - target_dt).total_seconds()))
+        snap_dt = datetime.fromisoformat(snap["ts"])
+        age_secs = (now - snap_dt).total_seconds()
 
         # Deltas (current − snapshot)
         ce_now  = current.get("ce_oi_total", 0)
@@ -215,13 +245,13 @@ def get_trend_table(symbol: str, current: dict) -> list[dict]:
 
         interpretation = " | ".join(parts)
         snap_age_min = age_secs / 60
-        age_str = "snapshot @ {} ({:.0f}min ago)".format(
+        age_str = "snapshot @ {} IST ({:.0f} min ago)".format(
             snap_dt.strftime("%H:%M"), snap_age_min)
 
         rows.append({
             "window":         label,
             "has_data":       True,
-            "snap_time":      snap_dt.strftime("%H:%M"),
+            "snap_time":      snap_dt.strftime("%H:%M IST"),
             "age_str":        age_str,
             "ce_chg":         int(ce_chg),
             "pe_chg":         int(pe_chg),
@@ -241,9 +271,14 @@ def get_trend_table(symbol: str, current: dict) -> list[dict]:
 
 
 def first_snapshot_time(symbol: str) -> str | None:
-    """Return ISO timestamp of earliest snapshot for this symbol, or None."""
+    """Return 'HH:MM IST' of earliest snapshot for this symbol, or None."""
     snaps = _prune(_load())
     mine  = [s for s in snaps if s.get("symbol", "") == symbol]
     if not mine:
         return None
-    return min(s["ts"] for s in mine)
+    earliest_ts = min(s["ts"] for s in mine)
+    try:
+        dt = datetime.fromisoformat(earliest_ts)
+        return dt.strftime("%H:%M IST")
+    except Exception:
+        return earliest_ts
