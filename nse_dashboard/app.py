@@ -377,9 +377,12 @@ with tab_live:
         st.markdown("#### Analysis Breakdown")
         for r in sig["reasons"]:
             rl   = r.lower()
-            icon = "ðŸŸ¢" if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]) else \
-                   "ðŸ”´" if any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]) else "ðŸŸ¡"
-            st.markdown(icon + " " + r)
+            if any(w in rl for w in [“bullish”,”support”,”upward”,”pe writing”,”put sum”,”itm ratio”,”covering”]):
+                st.markdown('<span style=”color:#26a69a”>▲</span> ' + r, unsafe_allow_html=True)
+            elif any(w in rl for w in [“bearish”,”resistance”,”downward”,”ce writing”,”call sum”]):
+                st.markdown('<span style=”color:#ef5350”>▼</span> ' + r, unsafe_allow_html=True)
+            else:
+                st.markdown('<span style=”color:#FF9800”>◆</span> ' + r, unsafe_allow_html=True)
         st.markdown("---")
         st.markdown("#### Key Levels")
         st.dataframe(pd.DataFrame({
@@ -426,6 +429,89 @@ with tab_live:
 **Simple rule**: If CE OI is going DOWN and PE OI is going UP → Smart money is BULLISH (defending puts, covering calls).
 If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
 """)
+
+    # ── Live Technical Trend (EMA crossover + VWAP HLC3) ─────────────────────
+    st.markdown("#### Live Technical Indicators")
+    if _intra_t is not None and not _intra_t.empty and len(_intra_t) >= 5:
+        _lt  = _intra_t.iloc[-1]
+        _e9  = float(_lt.get("ema9",  0))
+        _e20 = float(_lt.get("ema20", 0))
+        _vwap  = float(_lt.get("vwap",  0))
+        _close = float(_lt.get("close", underlying))
+        _rsi   = float(_lt.get("rsi",   50))
+        _macd_v = float(_lt.get("macd",     0))
+        _macd_s = float(_lt.get("macd_sig", 0))
+
+        # EMA crossover: find how many bars ago it last crossed
+        _ema_bull_now  = _intra_t["ema9"] > _intra_t["ema20"]
+        _cross_changes = _ema_bull_now != _ema_bull_now.shift(1)
+        _cross_indices = _intra_t.index[_cross_changes & (_intra_t.index > 0)].tolist()
+        _cross_bars_ago = (len(_intra_t) - 1 - _cross_indices[-1]) if _cross_indices else None
+        _cross_dir = "Bullish cross UP" if bool(_ema_bull_now.iloc[-1]) else "Bearish cross DOWN"
+        _cross_txt = "{} ({} candles ago)".format(_cross_dir, _cross_bars_ago) \
+                     if _cross_bars_ago is not None else "No crossover in this window"
+
+        _ema_status  = "EMA9 > EMA20 — Uptrend" if _e9 > _e20 else "EMA9 < EMA20 — Downtrend"
+        _vwap_diff   = _close - _vwap
+        _vwap_pct    = _vwap_diff / _vwap * 100 if _vwap > 0 else 0
+        _vwap_status = ("Above VWAP +{:.0f} pts ({:+.2f}%) — Intraday Bullish".format(_vwap_diff, _vwap_pct)
+                        if _vwap_diff >= 0 else
+                        "Below VWAP {:.0f} pts ({:+.2f}%) — Intraday Bearish".format(_vwap_diff, _vwap_pct))
+        _macd_status = ("MACD {:.1f} > Signal {:.1f} — Momentum Bullish".format(_macd_v, _macd_s)
+                        if _macd_v > _macd_s else
+                        "MACD {:.1f} < Signal {:.1f} — Momentum Bearish".format(_macd_v, _macd_s))
+        _rsi_status  = ("RSI {:.0f} — Overbought (sell pressure)".format(_rsi) if _rsi > 70 else
+                        "RSI {:.0f} — Oversold (watch for bounce)".format(_rsi) if _rsi < 30 else
+                        "RSI {:.0f} — {}".format(_rsi, "Bullish range (55-70)" if _rsi > 55 else
+                                                         "Bearish range (30-45)" if _rsi < 45 else "Neutral zone (45-55)"))
+
+        _tech_df = pd.DataFrame([
+            {
+                "Indicator":   "EMA 9 / EMA 20",
+                "Current":     "EMA9 Rs.{:,.1f}  |  EMA20 Rs.{:,.1f}".format(_e9, _e20),
+                "Status":      _ema_status,
+                "Cross event": _cross_txt,
+                "Meaning":     "EMA9 > EMA20 = short-term uptrend. Cross UP = new bull trend starting.",
+            },
+            {
+                "Indicator":   "VWAP HLC3 (Session)",
+                "Current":     "VWAP Rs.{:,.1f}  |  Price Rs.{:,.1f}".format(_vwap, _close),
+                "Status":      _vwap_status,
+                "Cross event": "Live",
+                "Meaning":     "Price above VWAP = buyers in control. Below VWAP = sellers in control.",
+            },
+            {
+                "Indicator":   "MACD (12, 26, 9)",
+                "Current":     "MACD {:.1f}  |  Signal {:.1f}  |  Hist {:+.1f}".format(_macd_v, _macd_s, _macd_v - _macd_s),
+                "Status":      _macd_status,
+                "Cross event": "Histogram growing" if abs(_macd_v - _macd_s) > abs(float(_intra_t.iloc[-2].get("macd_hist", 0))) else "Histogram shrinking",
+                "Meaning":     "MACD crosses Signal = trend change. Histogram growing = momentum increasing.",
+            },
+            {
+                "Indicator":   "RSI 14",
+                "Current":     "RSI {:.1f}".format(_rsi),
+                "Status":      _rsi_status,
+                "Cross event": ">70 = Overbought  |  <30 = Oversold",
+                "Meaning":     "RSI >60 = bullish push. RSI <40 = bearish pressure. 40-60 = consolidation.",
+            },
+        ])
+
+        def _s_col(v):
+            v = str(v)
+            if any(w in v.lower() for w in ["bullish","uptrend","above","bounce"]):
+                return "color:#26a69a;font-weight:bold"
+            if any(w in v.lower() for w in ["bearish","downtrend","below","overbought","sell"]):
+                return "color:#ef5350;font-weight:bold"
+            return "color:#FF9800"
+
+        st.dataframe(
+            _tech_df.style.map(_s_col, subset=["Status"]),
+            use_container_width=True, hide_index=True, height=195,
+        )
+    else:
+        st.info("Intraday candles loading — EMA/VWAP indicators appear after first fetch.")
+
+    st.divider()
 
     # Build current state dict for delta computation
     _oi_current = {
@@ -708,7 +794,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         st.plotly_chart(f2, use_container_width=True)
         # Net OI flow summary
         net_total = net_oi_flow.sum()
-        flow_bias = "ðŸŸ¢ PE writing dominates (Bullish)" if net_total > 0 else "ðŸ”´ CE writing dominates (Bearish)"
+        flow_bias = "[BULL] PE writing dominates (Bullish)" if net_total > 0 else "[BEAR] CE writing dominates (Bearish)"
         st.caption("Net OI Flow: {:+.1f}K â†’ {}".format(net_total, flow_bias))
 
     ic1, ic2 = st.columns(2)
@@ -906,15 +992,15 @@ with tab_scan:
         watching = [r for r in scan_results if r["signal"] == "WATCH"]
 
         sb1, sb2, sb3 = st.columns(3)
-        sb1.metric("ðŸŸ¢ Bullish",  len(bullish))
-        sb2.metric("ðŸ”´ Bearish",  len(bearish))
-        sb3.metric("ðŸŸ¡ Watch",    len(watching))
+        sb1.metric("[BULL] Bullish",  len(bullish))
+        sb2.metric("[BEAR] Bearish",  len(bearish))
+        sb3.metric("[NEUT] Watch",    len(watching))
         st.divider()
 
         # Ranked table
         st.markdown("### Ranked by Conviction (strongest first)")
         for r in scan_results:
-            sig_icon = "ðŸŸ¢" if r["signal"] == "BUY CALL" else "ðŸ”´" if r["signal"] == "BUY PUT" else "ðŸŸ¡"
+            sig_icon = "[BULL]" if r["signal"] == "BUY CALL" else "[BEAR]" if r["signal"] == "BUY PUT" else "[NEUT]"
             border   = "#4CAF50" if r["signal"] == "BUY CALL" else "#ef5350" if r["signal"] == "BUY PUT" else "#FF9800"
 
             with st.expander("{} **{}** — {} (conviction: {:+.0f})".format(
@@ -1024,8 +1110,8 @@ with tab_exp:
 
         exp_sig = ea.expiry_scalp_signal(df, meta, sig, atm_iv=atm_iv_exp)
 
-        sig_icon = "ðŸŸ¢" if exp_sig["direction"] == "BUY CALL" else \
-                   "ðŸ”´" if exp_sig["direction"] == "BUY PUT" else "ðŸŸ¡"
+        sig_icon = "[BULL]" if exp_sig["direction"] == "BUY CALL" else \
+                   "[BEAR]" if exp_sig["direction"] == "BUY PUT" else "[NEUT]"
         sig_bg   = {"BUY CALL": "#0a2a0a", "BUY PUT": "#2a0a0a"}.get(exp_sig["direction"], "#2a2a00")
         sig_col_ = {"BUY CALL": "#4CAF50", "BUY PUT": "#ef5350"}.get(exp_sig["direction"], "#FF9800")
 

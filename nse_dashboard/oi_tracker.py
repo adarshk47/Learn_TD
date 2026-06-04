@@ -159,13 +159,13 @@ def get_trend_table(symbol: str, current: dict) -> list[dict]:
             ready_at_ist   = now + timedelta(seconds=need_more_secs)
             rows.append({
                 "window": label, "has_data": False,
-                "snap_time": _ist_str(first_ts) if first_ts else "--",
-                "age_str": "Tracking since {} IST ({:.0f} min ago)".format(
-                    first_ts.strftime("%H:%M"), age_of_oldest / 60) if first_ts else "--",
+                "snap_time": first_ts.strftime("%H:%M IST") if first_ts else "--",
+                "age_str": "Tracking since {} ({:.0f} min ago)".format(
+                    first_ts.strftime("%H:%M IST"), age_of_oldest / 60) if first_ts else "--",
                 "ce_chg": None, "pe_chg": None, "net_flow": None,
                 "pcr_chg": None, "ce_chg_pct": None, "pe_chg_pct": None,
                 "trend": "Collecting",
-                "interpretation": "Data ready at {} IST (in ~{} min)".format(
+                "interpretation": "Data ready at {} (in ~{} min)".format(
                     _ist_str(ready_at_ist), need_more_min),
                 "spot_then": None, "spot_chg": None,
             })
