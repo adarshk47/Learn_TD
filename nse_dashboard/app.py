@@ -30,7 +30,7 @@ st.set_page_config(
 
 st.markdown("<style>.stMetric > div { font-size: 18px; }</style>", unsafe_allow_html=True)
 
-# â”€â”€ Sidebar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("NSE Options Intelligence")
     st.divider()
@@ -38,9 +38,9 @@ with st.sidebar:
     instrument_type = st.radio("Instrument Type", ["Index", "Stock"])
 
     if instrument_type == "Index":
-        index_options = ["{} â€” {}".format(k, v) for k, v in INDICES.items()]
+        index_options = ["{} — {}".format(k, v) for k, v in INDICES.items()]
         selected_idx  = st.selectbox("Select Index", index_options)
-        symbol        = selected_idx.split(" â€” ")[0]
+        symbol        = selected_idx.split(" — ")[0]
         is_index      = True
     else:
         search_query = st.text_input(
@@ -49,9 +49,9 @@ with st.sidebar:
         ).upper().strip()
         suggestions = search_stocks(search_query)
         if suggestions:
-            opts     = ["{} â€” {}".format(s, n) for s, n in suggestions]
+            opts     = ["{} — {}".format(s, n) for s, n in suggestions]
             selected = st.selectbox("Matches", opts, index=0)
-            symbol   = selected.split(" â€” ")[0]
+            symbol   = selected.split(" — ")[0]
         else:
             st.warning("No match. Using: " + search_query)
             symbol = search_query
@@ -90,13 +90,13 @@ with st.sidebar:
 
     st.caption("Updated: {}  |  {}".format(datetime.now().strftime("%H:%M:%S"), APP_VERSION))
 
-# â”€â”€ Test NSE connection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Test NSE connection ───────────────────────────────────────────────────────
 if test_mode:
     with st.spinner("Testing NSE connection for {} ...".format(symbol)):
         raw = fetch_option_chain(symbol, is_index)
     if "error" in raw:
         st.error("NSE connection FAILED: " + raw["error"])
-        st.info("Try during market hours (9:15 AM â€“ 3:30 PM IST) on Indian internet.")
+        st.info("Try during market hours (9:15 AM “ 3:30 PM IST) on Indian internet.")
     elif not raw:
         st.error("NSE returned empty response.")
     else:
@@ -109,7 +109,7 @@ if test_mode:
             st.write("record count:", len(rec.get("data", [])))
     st.stop()
 
-# â”€â”€ Cached data fetchers (module-level for st.cache_data) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Cached data fetchers (module-level for st.cache_data) ─────────────────────
 
 @st.cache_data(ttl=60)
 def _get_nse_data(sym, idx, strikes):
@@ -226,14 +226,14 @@ def _compute_tech(df):
     d["net_vol"]= d["volume"] * np.sign(d["close"].diff().fillna(0))
     return d
 
-# â”€â”€ Data fetch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Data fetch ────────────────────────────────────────────────────────────────
 
 df   = pd.DataFrame()
 meta = {}
 
 if data_source == "Demo Mode":
     df, meta = generate_demo_option_chain(symbol if is_index else "NIFTY")
-    st.info("Demo Mode ON â€” simulated data. Switch Data Source for live data.")
+    st.info("Demo Mode ON — simulated data. Switch Data Source for live data.")
 
 elif data_source == "NSE CSV Upload":
     if csv_file is None:
@@ -283,7 +283,7 @@ if df.empty:
     st.warning("No option chain data. Enable Demo Mode to preview.")
     st.stop()
 
-# â”€â”€ Shared signal computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Shared signal computation ─────────────────────────────────────────────────
 sig        = generate_signal(df, meta)
 underlying = meta["underlying"]
 expiry     = meta["expiry"]
@@ -303,37 +303,37 @@ try:
 except Exception:
     pass
 
-# â”€â”€ Tabs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_live, tab_scan, tab_exp, tab_bt, tab_pt, tab_chat = st.tabs(
     ["Live Dashboard", "Market Scanner", "Expiry Signals",
      "Backtest", "Paper Trade", "Chat"]
 )
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 1 â€” LIVE DASHBOARD
+# TAB 1 — LIVE DASHBOARD
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_live:
-    st.markdown("## {} Option Chain  â€”  Expiry: **{}**".format(symbol, expiry))
-    st.markdown("**Spot: â‚¹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
+    st.markdown("## {} Option Chain  —  Expiry: **{}**".format(symbol, expiry))
+    st.markdown("**Spot: ₹{:,.2f}**  |  ATM: **{}**  |  Source: `{}`".format(
         underlying, meta["atm"], source_tag))
     st.divider()
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spot Price",    "â‚¹{:,.1f}".format(underlying))
+    c1.metric("Spot Price",    "₹{:,.1f}".format(underlying))
     c2.metric("PCR",           str(pcr), delta="Bullish" if pcr > 1.0 else "Bearish")
-    c3.metric("Max Pain",      "â‚¹{:,.0f}".format(max_pain))
-    c4.metric("CE Resistance", "â‚¹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
-    c5.metric("PE Support",    "â‚¹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
+    c3.metric("Max Pain",      "₹{:,.0f}".format(max_pain))
+    c4.metric("CE Resistance", "₹{:,.0f}".format(sig["max_ce_resistance"]), delta="Sell Wall")
+    c5.metric("PE Support",    "₹{:,.0f}".format(sig["max_pe_support"]),    delta="Buy Wall")
 
-    # â”€â”€ OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) â”€
+    # ── OI Intelligence row (from VarunS2002 3-strike sum + ITM ratio research) ─
     oi1, oi2, oi3, oi4, oi5 = st.columns(5)
     call_sum_v = sig.get("call_sum", 0)
     put_sum_v  = sig.get("put_sum", 0)
     oi_diff_v  = sig.get("oi_difference", 0)
     itm_r      = sig.get("itm_ratio", 0)
-    oi1.metric("Call Sum (ATMÂ±1)", "{:+.1f}K".format(call_sum_v),
+    oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
                delta="CE writing â†‘" if call_sum_v > 0 else "CE covering â†“")
-    oi2.metric("Put Sum (ATMÂ±1)", "{:+.1f}K".format(put_sum_v),
+    oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
                delta="PE writing â†‘" if put_sum_v > 0 else "PE covering â†“")
     oi3.metric("OI Difference", "{:+.1f}K".format(oi_diff_v),
                delta="Bearish" if oi_diff_v > 0 else "Bullish")
@@ -440,11 +440,10 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
     _trend_rows = oit.get_trend_table(symbol, _oi_current)
     _first_snap = oit.first_snapshot_time(symbol)
     if _first_snap:
-        from datetime import datetime as _dt
-        _since = _dt.fromisoformat(_first_snap).strftime("%H:%M")
-        st.caption("📌 Tracking since **{}** today. Snapshots auto-saved every refresh.".format(_since))
+        # first_snapshot_time() returns "HH:MM IST" formatted string directly
+        st.caption("Tracking since **{}** today. Snapshots auto-saved every refresh.".format(_first_snap))
     else:
-        st.info("⏳ First snapshot will be saved now. Refresh the page after 5 minutes to see changes.")
+        st.info("First snapshot saving now. Refresh in 5 minutes to see 5-min window data.")
 
     # Render table
     _display_rows = []
@@ -654,7 +653,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
 
     cc1, cc2 = st.columns(2)
     with cc1:
-        st.markdown("#### Open Interest Distribution â€” Murphy Support/Resistance")
+        st.markdown("#### Open Interest Distribution — Murphy Support/Resistance")
         f = go.Figure()
         # CE OI bars (resistance above spot)
         ce_colors = ["#b71c1c" if s > underlying else "#ef5350" for s in df["strike"]]
@@ -682,7 +681,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         st.plotly_chart(f, use_container_width=True)
 
     with cc2:
-        st.markdown("#### OI Change â€” Velocity & Direction (Net Flow)")
+        st.markdown("#### OI Change — Velocity & Direction (Net Flow)")
         # Net OI flow: PE build - CE build at each strike
         net_oi_flow = (df["pe_chg_oi"] - df["ce_chg_oi"]) / 1000
         flow_colors = ["#26a69a" if v > 0 else "#ef5350" for v in net_oi_flow]
@@ -704,7 +703,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                          legend=dict(orientation="h", y=1.1),
                          xaxis=dict(title="Strike", gridcolor="#333"),
-                         yaxis=dict(title="Chg OI (K) â€” +ve = PE writing (bullish)", gridcolor="#333"),
+                         yaxis=dict(title="Chg OI (K) — +ve = PE writing (bullish)", gridcolor="#333"),
                          margin=dict(t=20, b=10))
         st.plotly_chart(f2, use_container_width=True)
         # Net OI flow summary
@@ -733,25 +732,25 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
     with ic2:
         st.markdown("#### PCR Interpretation")
         if   pcr > 1.5: interp, pcr_col = "EXTREMELY BULLISH",           "#00e676"
-        elif pcr > 1.2: interp, pcr_col = "BULLISH â€” strong put writing", "#4CAF50"
+        elif pcr > 1.2: interp, pcr_col = "BULLISH — strong put writing", "#4CAF50"
         elif pcr > 0.8: interp, pcr_col = "NEUTRAL to BULLISH",           "#8BC34A"
         elif pcr > 0.5: interp, pcr_col = "NEUTRAL to BEARISH",           "#FF9800"
-        else:           interp, pcr_col = "BEARISH â€” heavy call writing",  "#f44336"
+        else:           interp, pcr_col = "BEARISH — heavy call writing",  "#f44336"
         st.markdown(
             '<div style="background:#1e1e2e;padding:20px;border-radius:12px;">'
             '<div style="font-size:48px;font-weight:bold;color:{};text-align:center;">{}</div>'
             '<div style="font-size:16px;color:{};text-align:center;margin-top:8px;">{}</div>'
             '<hr style="border-color:#333;margin:15px 0;">'
             '<div style="font-size:13px;color:#aaa;">'
-            'PCR &lt;0.5=Bearish | 0.5â€“0.8=Neutral-Bearish<br>'
-            'PCR 0.8â€“1.2=Neutral | 1.2â€“1.5=Bullish | &gt;1.5=Extremely Bullish'
+            'PCR &lt;0.5=Bearish | 0.5“0.8=Neutral-Bearish<br>'
+            'PCR 0.8“1.2=Neutral | 1.2“1.5=Bullish | &gt;1.5=Extremely Bullish'
             '</div></div>'.format(pcr_col, pcr, pcr_col, interp),
             unsafe_allow_html=True
         )
 
     st.divider()
 
-    # â”€â”€ Expiry proximity alert â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Expiry proximity alert ────────────────────────────────────────────────
     h_left = ea.hours_to_expiry(expiry)
     atm_iv = float(df.iloc[(df["strike"] - underlying).abs().idxmin()]["ce_iv"])
     if atm_iv == 0:
@@ -760,7 +759,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
     if 0 < h_left <= 6.5:  # expiry day
         st.markdown(
             '<div style="background:#3d0000;border:2px solid #ef5350;padding:12px;border-radius:10px;margin-bottom:10px;">'
-            '<b style="color:#ef5350;">âš¡ EXPIRY DAY</b> â€” {:.1f} market hours left | '
+            '<b style="color:#ef5350;">âš¡ EXPIRY DAY</b> — {:.1f} market hours left | '
             'Switch to <b>ðŸ“… Expiry Signals</b> tab for scalp targets</div>'.format(h_left),
             unsafe_allow_html=True
         )
@@ -770,13 +769,13 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         if "error" not in next_info:
             st.markdown(
                 '<div style="background:#1a2a00;border:2px solid #8BC34A;padding:12px;border-radius:10px;margin-bottom:10px;">'
-                '<b style="color:#8BC34A;">â° Expiry Tomorrow</b> â€” Next expiry: <b>{}</b> | '
+                '<b style="color:#8BC34A;">â° Expiry Tomorrow</b> — Next expiry: <b>{}</b> | '
                 'Switch to <b>ðŸ“… Expiry Signals</b> for next-expiry analysis</div>'.format(
                     next_info.get("next_expiry", "")),
                 unsafe_allow_html=True
             )
 
-    st.markdown("### Prediction â€” {} Â· ATM IV: {}%".format(
+    st.markdown("### Prediction — {} Â· ATM IV: {}%".format(
         "Today's Range" if h_left <= 6.5 else "Tomorrow", round(atm_iv, 1)))
 
     daily_move  = underlying * (atm_iv / 100) * math.sqrt(1 / 252)
@@ -796,9 +795,9 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         st.markdown(
             '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
             '<div style="color:#aaa;font-size:13px;">Expected Daily Range (IV={}%)</div>'
-            '<div style="font-size:22px;font-weight:bold;color:#26a69a;margin:8px 0;">Â±â‚¹{:,.0f}</div>'
-            '<div style="color:#ccc;font-size:14px;">Upper: <b>â‚¹{:,.0f}</b></div>'
-            '<div style="color:#ccc;font-size:14px;">Lower: <b>â‚¹{:,.0f}</b></div>'
+            '<div style="font-size:22px;font-weight:bold;color:#26a69a;margin:8px 0;">±₹{:,.0f}</div>'
+            '<div style="color:#ccc;font-size:14px;">Upper: <b>₹{:,.0f}</b></div>'
+            '<div style="color:#ccc;font-size:14px;">Lower: <b>₹{:,.0f}</b></div>'
             '</div>'.format(round(atm_iv, 1), daily_move, upper_level, lower_level),
             unsafe_allow_html=True
         )
@@ -818,8 +817,8 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         st.markdown(
             '<div style="background:#1e1e2e;padding:18px;border-radius:12px;text-align:center;">'
             '<div style="color:#aaa;font-size:13px;">Max Pain Magnet</div>'
-            '<div style="font-size:22px;font-weight:bold;color:#FFD700;margin:8px 0;">â‚¹{:,.0f}</div>'
-            '<div style="color:#ccc;font-size:13px;">â‚¹{:,.0f} {} spot</div>'
+            '<div style="font-size:22px;font-weight:bold;color:#FFD700;margin:8px 0;">₹{:,.0f}</div>'
+            '<div style="color:#ccc;font-size:13px;">₹{:,.0f} {} spot</div>'
             '<div style="color:#ccc;font-size:13px;">{}</div>'
             '</div>'.format(max_pain, abs(pain_diff), mp_dir, mp_pull),
             unsafe_allow_html=True
@@ -828,9 +827,9 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
     st.markdown(
         '<div style="background:#1e1e2e;padding:15px;border-radius:10px;margin-top:10px;">'
         '<b style="color:#aaa;">Key Levels for Tomorrow</b><br>'
-        '<span style="color:#ef5350;">Resistance: â‚¹{:,.0f} (max CE OI)  |  Upper: â‚¹{:,.0f}</span><br>'
-        '<span style="color:#26a69a;">Support: â‚¹{:,.0f} (max PE OI)  |  Lower: â‚¹{:,.0f}</span><br>'
-        '<span style="color:#FFD700;">Max Pain: â‚¹{:,.0f}  |  Spot: â‚¹{:,.0f}</span>'
+        '<span style="color:#ef5350;">Resistance: ₹{:,.0f} (max CE OI)  |  Upper: ₹{:,.0f}</span><br>'
+        '<span style="color:#26a69a;">Support: ₹{:,.0f} (max PE OI)  |  Lower: ₹{:,.0f}</span><br>'
+        '<span style="color:#FFD700;">Max Pain: ₹{:,.0f}  |  Spot: ₹{:,.0f}</span>'
         '</div>'.format(
             sig["max_ce_resistance"], upper_level,
             sig["max_pe_support"],    lower_level,
@@ -868,7 +867,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 2 â€” MARKET SCANNER
+# TAB 2 — MARKET SCANNER
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_scan:
     st.markdown("## ðŸ” Market Scanner")
@@ -918,7 +917,7 @@ with tab_scan:
             sig_icon = "ðŸŸ¢" if r["signal"] == "BUY CALL" else "ðŸ”´" if r["signal"] == "BUY PUT" else "ðŸŸ¡"
             border   = "#4CAF50" if r["signal"] == "BUY CALL" else "#ef5350" if r["signal"] == "BUY PUT" else "#FF9800"
 
-            with st.expander("{} **{}** â€” {} (conviction: {:+.0f})".format(
+            with st.expander("{} **{}** — {} (conviction: {:+.0f})".format(
                     sig_icon, r["symbol"], r["signal"], r["conviction"]), expanded=False):
 
                 ec1, ec2, ec3, ec4 = st.columns(4)
@@ -936,7 +935,7 @@ with tab_scan:
                 ec7.metric("Vol Ratio",   "{:.1f}x".format(r["vol_ratio"]),
                             delta="High volume" if r["vol_ratio"] > 1.5 else "Normal")
 
-                st.markdown("**Murphy OI Signal:** {} â€” {}".format(r["murphy_signal"], r["murphy_note"]))
+                st.markdown("**Murphy OI Signal:** {} — {}".format(r["murphy_signal"], r["murphy_note"]))
                 st.caption("Natenberg: {}".format(r["iv_note"]))
 
         st.divider()
@@ -979,7 +978,7 @@ with tab_scan:
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 3 â€” EXPIRY SIGNALS
+# TAB 3 — EXPIRY SIGNALS
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_exp:
     st.markdown("## ðŸ“… Expiry Signals")
@@ -997,31 +996,31 @@ with tab_exp:
 
     h_left_exp = ea.hours_to_expiry(expiry)
 
-    # â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Header ────────────────────────────────────────────────────────────────
     if h_left_exp <= 0:
         st.error("âš ï¸ Current expiry {} has passed. Showing analysis for reference.".format(expiry))
     elif h_left_exp <= 6.5:
         st.markdown(
             '<div style="background:#2d0000;border:2px solid #ef5350;padding:15px;border-radius:12px;">'
-            '<h3 style="color:#ef5350;margin:0;">âš¡ EXPIRY DAY â€” {:.1f} market hours left</h3>'
+            '<h3 style="color:#ef5350;margin:0;">âš¡ EXPIRY DAY — {:.1f} market hours left</h3>'
             '<p style="color:#ccc;margin:5px 0 0 0;">Augen (2009): Max Pain magnet effect strongest in last 2 hours. '
-            'Gamma spikes near ATM â€” scalp targets 30â€“80 points on NIFTY.</p>'
+            'Gamma spikes near ATM — scalp targets 30“80 points on NIFTY.</p>'
             '</div>'.format(h_left_exp),
             unsafe_allow_html=True
         )
     elif h_left_exp <= 24:
         st.warning("â° Expiry **{}** is tomorrow. Check next expiry below.".format(expiry))
     else:
-        st.info("Current expiry: **{}** â€” {:.1f} market hours remaining".format(expiry, h_left_exp))
+        st.info("Current expiry: **{}** — {:.1f} market hours remaining".format(expiry, h_left_exp))
 
     st.divider()
 
-    # â”€â”€ Expiry day scalp signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Expiry day scalp signal ────────────────────────────────────────────────
     exp_col, next_col = st.columns(2)
 
     with exp_col:
         st.markdown("### Expiry Scalp Signal (Augen Framework)")
-        st.caption("Volume + OI change + Max Pain â€” 30â€“50 point targets")
+        st.caption("Volume + OI change + Max Pain — 30“50 point targets")
 
         exp_sig = ea.expiry_scalp_signal(df, meta, sig, atm_iv=atm_iv_exp)
 
@@ -1049,9 +1048,9 @@ with tab_exp:
         st.markdown("---")
         st.markdown("**Expected Range (Natenberg IV-based)**")
         rc1, rc2, rc3 = st.columns(3)
-        rc1.metric("Upper", "â‚¹{:,.0f}".format(er["upper"]))
-        rc2.metric("Move Â±", "â‚¹{:,.0f}".format(er["move_pts"]))
-        rc3.metric("Lower", "â‚¹{:,.0f}".format(er["lower"]))
+        rc1.metric("Upper", "₹{:,.0f}".format(er["upper"]))
+        rc2.metric("Move ±", "₹{:,.0f}".format(er["move_pts"]))
+        rc3.metric("Lower", "₹{:,.0f}".format(er["lower"]))
 
         # Trade params
         st.markdown("---")
@@ -1062,12 +1061,12 @@ with tab_exp:
         st.dataframe(pd.DataFrame({
             "Parameter": ["ATM Premium (est.)", "Stop-Loss (âˆ’30%)", "Target (+50%)",
                           "Points Target", "Lot Size", "Best Hold"],
-            "Value":     ["â‚¹{:.1f}".format(prem),
-                          "â‚¹{:.1f}".format(sl_p),
-                          "â‚¹{:.1f}".format(tg_p),
-                          "Â±{} pts (NIFTY)".format(exp_sig["pts_target"]),
+            "Value":     ["₹{:.1f}".format(prem),
+                          "₹{:.1f}".format(sl_p),
+                          "₹{:.1f}".format(tg_p),
+                          "±{} pts (NIFTY)".format(exp_sig["pts_target"]),
                           "{} units".format(exp_sig["lot_size"]),
-                          "30â€“60 min or 3:15 PM"]
+                          "30“60 min or 3:15 PM"]
         }), hide_index=True, use_container_width=True)
 
     with next_col:
@@ -1085,9 +1084,9 @@ with tab_exp:
 
             nr = nxt["expected_range"]
             nc1, nc2, nc3 = st.columns(3)
-            nc1.metric("Upper", "â‚¹{:,.0f}".format(nr["upper"]))
-            nc2.metric("Move Â±", "â‚¹{:,.0f}".format(nr["move_pts"]))
-            nc3.metric("Lower", "â‚¹{:,.0f}".format(nr["lower"]))
+            nc1.metric("Upper", "₹{:,.0f}".format(nr["upper"]))
+            nc2.metric("Move ±", "₹{:,.0f}".format(nr["move_pts"]))
+            nc3.metric("Lower", "₹{:,.0f}".format(nr["lower"]))
 
             st.markdown("---")
             st.markdown("**Strategy Recommendation (Natenberg)**")
@@ -1103,7 +1102,7 @@ with tab_exp:
 
         # Augen Gamma Zones
         st.markdown("### Gamma Hot Zones (Augen)")
-        st.caption("Strikes where OI creates strongest magnet effect â€” expiry day key levels")
+        st.caption("Strikes where OI creates strongest magnet effect — expiry day key levels")
         zones = ea.augen_gamma_zones(df, underlying, h_left_exp)
         if zones:
             z_df = pd.DataFrame(zones)[["strike","type","ce_oi","pe_oi","pull_score","dist_pts"]]
@@ -1120,39 +1119,39 @@ with tab_exp:
 
     st.divider()
 
-    # â”€â”€ Theory section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Theory section ────────────────────────────────────────────────────────
     st.markdown("### Expiry Day Trading Methodology")
-    with st.expander("ðŸ“– Augen (2009) â€” Expiry Day Framework", expanded=False):
+    with st.expander("ðŸ“– Augen (2009) — Expiry Day Framework", expanded=False):
         st.markdown("""
 **From "Trading Options at Expiration" by Jeff Augen:**
 
 1. **Gamma Spike**: ATM options gain gamma exponentially on expiry day.
    - A 0.5% move in the underlying can double/halve an ATM option's price
-   - Trade smaller size â€” premium moves are violent
+   - Trade smaller size — premium moves are violent
 
 2. **Max Pain Magnet**: In last 2 hours, underlying gravitates toward Max Pain
    - Below Max Pain â†’ call writers buy back â†’ price rises
    - Above Max Pain â†’ put writers buy back â†’ price falls
 
 3. **Time-of-day patterns (NSE Expiry)**:
-   - 9:20â€“10:30 AM: Gap fills and initial direction established
-   - 12:00â€“1:30 PM: Lull â€” avoid trading, volume low
-   - 2:00â€“3:15 PM: Max Pain pull strongest â€” last hour most reliable
+   - 9:20“10:30 AM: Gap fills and initial direction established
+   - 12:00“1:30 PM: Lull — avoid trading, volume low
+   - 2:00“3:15 PM: Max Pain pull strongest — last hour most reliable
 
 4. **Target sizing for NIFTY**:
-   - 5 min expiry scalp: Â±15-25 pts
-   - 15 min expiry trade: Â±30-50 pts
-   - Full session: Â±60-100 pts
-   - Set tight SL (25-30% of premium) â€” gamma can reverse quickly
+   - 5 min expiry scalp: ±15-25 pts
+   - 15 min expiry trade: ±30-50 pts
+   - Full session: ±60-100 pts
+   - Set tight SL (25-30% of premium) — gamma can reverse quickly
 
 5. **Strike selection on expiry day**:
    - ATM = 0.5 delta = best for directional trades
    - 1-OTM = cheaper but lower delta, harder to recover from wrong direction
         """)
 
-    with st.expander("ðŸ“– Murphy (1999) â€” OI Analysis on Expiry", expanded=False):
+    with st.expander("ðŸ“– Murphy (1999) — OI Analysis on Expiry", expanded=False):
         st.markdown("""
-**From "Technical Analysis of Financial Markets" (Chapter 7 â€” Volume and OI):**
+**From "Technical Analysis of Financial Markets" (Chapter 7 — Volume and OI):**
 
 | OI Change | Price Change | Interpretation | Action |
 |-----------|-------------|----------------|--------|
@@ -1161,16 +1160,16 @@ with tab_exp:
 | Falling OI + Rising Price | â†’ | Short covering (weak move) = **Rally may fade** | CAUTION |
 | Falling OI + Falling Price | â†’ | Long liquidation (selling easing) = **Recovery near** | WATCH |
 
-On expiry day, **net OI flow near ATM** (within Â±2 strikes) is the key signal:
+On expiry day, **net OI flow near ATM** (within ±2 strikes) is the key signal:
 - PE writers adding OI at support â†’ market expects to hold support â†’ BUY CALL
 - CE writers adding OI at resistance â†’ market expects to hold resistance â†’ BUY PUT
         """)
 
-    st.caption("âš ï¸ Educational only â€” not financial advice. Options trading involves significant risk.")
+    st.caption("âš ï¸ Educational only — not financial advice. Options trading involves significant risk.")
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 4 â€” BACKTEST & MODEL TRAINING
+# TAB 4 — BACKTEST & MODEL TRAINING
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_bt:
     st.markdown("## Backtest & Model Training")
@@ -1181,7 +1180,7 @@ with tab_bt:
     with left_bt:
         bt_mode = st.radio(
             "Mode",
-            ["A â€” Signal Accuracy", "B â€” P&L Simulation", "C â€” Forward Tracker", "Train Model"],
+            ["A — Signal Accuracy", "B — P&L Simulation", "C — Forward Tracker", "Train Model"],
         )
         bt_days = st.slider("Historical Days", 20, 90, 30, step=5)
         if data_source == "Angel One (Live)":
@@ -1192,12 +1191,12 @@ with tab_bt:
     with right_bt:
         candles = _get_candles(symbol, is_index, bt_days, data_source)
 
-        # â”€â”€ Mode A: Signal Accuracy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode A: Signal Accuracy ───────────────────────────────────────────
         if bt_mode.startswith("A"):
             st.markdown("### Signal Accuracy Backtest")
             st.markdown(
                 "Uses **RSI-14 + EMA-9/EMA-21 crossover + volume ratio** consensus "
-                "on {} daily candles. Signals fire only when 2+ indicators agree â€” "
+                "on {} daily candles. Signals fire only when 2+ indicators agree — "
                 "higher selectivity means fewer trades but better quality signals. "
                 "**Note:** Synthetic demo data is a random walk; near-50% win rate "
                 "on synthetic data is expected. Use Angel One for real results.".format(bt_days)
@@ -1241,9 +1240,9 @@ with tab_bt:
                     )
                     st.success("Today's signal auto-saved to Forward Tracker.")
 
-        # â”€â”€ Mode B: P&L Simulation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode B: P&L Simulation ────────────────────────────────────────────
         elif bt_mode.startswith("B"):
-            st.markdown("### P&L Simulation (â‚¹)")
+            st.markdown("### P&L Simulation (₹)")
             st.markdown(
                 "Buys 1 lot ATM option at estimated premium (0.8% of index price). "
                 "Win = 1.5Ã— premium, Loss = 0.4Ã— premium (approximate)."
@@ -1252,7 +1251,7 @@ with tab_bt:
                             "MIDCPNIFTY": 50, "SENSEX": 20}
             sim_lot  = st.number_input("Lot Size", value=lot_defaults.get(symbol.upper(), 75),
                                         min_value=1, max_value=500)
-            sim_comm = st.number_input("Commission per trade (â‚¹)", value=40,
+            sim_comm = st.number_input("Commission per trade (₹)", value=40,
                                         min_value=0, max_value=500)
 
             if st.button("Run P&L Simulation", type="primary", key="run_pnl"):
@@ -1263,37 +1262,37 @@ with tab_bt:
                 else:
                     pnl_color = "#26a69a" if metrics["total_pnl"] >= 0 else "#ef5350"
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Total P&L", "â‚¹{:,}".format(metrics["total_pnl"]),
+                    m1.metric("Total P&L", "₹{:,}".format(metrics["total_pnl"]),
                                delta="Profit" if metrics["total_pnl"] >= 0 else "Loss")
                     m2.metric("Win Rate",   "{}%".format(metrics["win_rate"]))
-                    m3.metric("Max Drawdown", "â‚¹{:,}".format(metrics["max_drawdown"]))
+                    m3.metric("Max Drawdown", "₹{:,}".format(metrics["max_drawdown"]))
                     m4.metric("Sharpe",     str(metrics["sharpe_ratio"]))
 
                     m5, m6, m7 = st.columns(3)
-                    m5.metric("Best Trade",  "â‚¹{:,}".format(metrics["best_trade"]))
-                    m6.metric("Worst Trade", "â‚¹{:,}".format(metrics["worst_trade"]))
-                    m7.metric("Avg P&L",     "â‚¹{:,}".format(int(metrics["avg_pnl"])))
+                    m5.metric("Best Trade",  "₹{:,}".format(metrics["best_trade"]))
+                    m6.metric("Worst Trade", "₹{:,}".format(metrics["worst_trade"]))
+                    m7.metric("Avg P&L",     "₹{:,}".format(int(metrics["avg_pnl"])))
 
                     fig_pnl = go.Figure()
                     fig_pnl.add_trace(go.Scatter(
                         x=rdf["date"], y=rdf["equity"],
                         mode="lines", fill="tozeroy",
                         line=dict(color=pnl_color, width=2),
-                        name="Cumulative P&L (â‚¹)"
+                        name="Cumulative P&L (₹)"
                     ))
                     fig_pnl.update_layout(
                         title="Cumulative P&L Curve",
                         height=280,
                         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                         xaxis=dict(gridcolor="#333", tickangle=-45),
-                        yaxis=dict(title="â‚¹", gridcolor="#333"),
+                        yaxis=dict(title="₹", gridcolor="#333"),
                         margin=dict(t=40, b=30)
                     )
                     st.plotly_chart(fig_pnl, use_container_width=True)
                     st.dataframe(rdf[["date","close","signal","premium","pnl","result","equity"]],
                                  use_container_width=True, height=280)
 
-        # â”€â”€ Mode C: Forward Tracker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode C: Forward Tracker ───────────────────────────────────────────
         elif bt_mode.startswith("C"):
             st.markdown("### Forward Paper Signal Tracker")
             st.markdown(
@@ -1311,7 +1310,7 @@ with tab_bt:
                         symbol, sig["signal"], sig["confidence"],
                         underlying, float(pcr), float(max_pain)
                     )
-                    st.success("Saved: {} {} @ â‚¹{:,.0f}".format(
+                    st.success("Saved: {} {} @ ₹{:,.0f}".format(
                         sig["signal"], symbol, underlying))
                     st.rerun()
 
@@ -1325,7 +1324,7 @@ with tab_bt:
                         st.metric("Forward Accuracy", "{}%".format(acc),
                                    delta="{} signals tracked".format(total))
                     else:
-                        st.info("{} signals tracked â€” awaiting resolution".format(total))
+                        st.info("{} signals tracked — awaiting resolution".format(total))
                 else:
                     st.info("No signals tracked yet.")
 
@@ -1344,7 +1343,7 @@ with tab_bt:
             else:
                 st.info("Click **Save Today's Signal** above to begin tracking.")
 
-        # â”€â”€ Mode: Train Model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Mode: Train Model ─────────────────────────────────────────────────
         else:
             st.markdown("### Model Weight Calibration")
             st.markdown(
@@ -1354,7 +1353,7 @@ with tab_bt:
             )
 
             if st.button("Run Grid Search (54 combinations)", type="primary", key="run_calib"):
-                with st.spinner("Calibrating â€” scanning 576 parameter combinationsâ€¦"):
+                with st.spinner("Calibrating — scanning 576 parameter combinationsâ€¦"):
                     st.session_state["_calib"] = model_train.calibrate_weights(candles)
 
             calib = st.session_state.get("_calib")
@@ -1404,31 +1403,31 @@ with tab_bt:
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 3 â€” PAPER TRADE
+# TAB 3 — PAPER TRADE
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_pt:
     pt.init_portfolio(st.session_state)
     summary = pt.get_summary(st.session_state, df, underlying)
 
-    st.markdown("## Paper Trading  â€”  Virtual â‚¹1,00,000 Capital")
+    st.markdown("## Paper Trading  —  Virtual ₹1,00,000 Capital")
     st.caption("All trades are simulated. No real money involved. "
                "Trades persist within a session and are saved locally.")
 
     # Portfolio metrics
     pc1, pc2, pc3, pc4 = st.columns(4)
-    pc1.metric("Available Capital", "â‚¹{:,.0f}".format(summary["capital"]))
+    pc1.metric("Available Capital", "₹{:,.0f}".format(summary["capital"]))
     pc2.metric("Realised P&L",
-               "â‚¹{:,.0f}".format(summary["realized_pnl"]),
+               "₹{:,.0f}".format(summary["realized_pnl"]),
                delta="+" + str(summary["realized_pnl"]) if summary["realized_pnl"] >= 0
                      else str(summary["realized_pnl"]))
-    pc3.metric("Unrealised P&L",    "â‚¹{:,.0f}".format(summary["unrealized_pnl"]))
+    pc3.metric("Unrealised P&L",    "₹{:,.0f}".format(summary["unrealized_pnl"]))
     pc4.metric("Total Return",
                "{}%".format(summary["total_return_pct"]),
                delta="{:+,.0f}".format(summary["total_pnl"]))
 
     st.divider()
 
-    # â”€â”€ Place Trade â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Place Trade ───────────────────────────────────────────────────────────
     st.markdown("### Place New Paper Trade")
 
     with st.form("place_trade_form"):
@@ -1438,7 +1437,7 @@ with tab_pt:
             pt_type = st.radio("Type", ["BUY CALL", "BUY PUT"])
         with fc2:
             def_strike = float(int(meta.get("atm", underlying) / 50) * 50)
-            pt_strike  = st.number_input("Strike Price â‚¹", value=def_strike,
+            pt_strike  = st.number_input("Strike Price ₹", value=def_strike,
                                           step=50.0, format="%.1f")
             pt_expiry  = st.text_input("Expiry", value=expiry)
         with fc3:
@@ -1449,7 +1448,7 @@ with tab_pt:
                 sugg = max(sugg, 1.0)
             else:
                 sugg = max(round(float(underlying) * 0.008, 2), 1.0)
-            pt_entry = st.number_input("Entry Premium â‚¹/unit", value=round(sugg, 2),
+            pt_entry = st.number_input("Entry Premium ₹/unit", value=round(sugg, 2),
                                         min_value=0.05, step=0.5, format="%.2f")
 
         if st.form_submit_button("Place Trade", type="primary", use_container_width=True):
@@ -1464,7 +1463,7 @@ with tab_pt:
 
     st.divider()
 
-    # â”€â”€ Open Trades â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Open Trades ───────────────────────────────────────────────────────────
     open_trades = summary["open_trades"]
     st.markdown("### Open Trades ({})".format(len(open_trades)))
 
@@ -1476,8 +1475,8 @@ with tab_pt:
             "Strike":   t["strike"],
             "Expiry":   t["expiry"],
             "Lots":     t["lots"],
-            "Entry â‚¹":  t["entry_price"],
-            "Cost â‚¹":   round(t["entry_price"] * t["lots"] * t["lot_size"], 2),
+            "Entry ₹":  t["entry_price"],
+            "Cost ₹":   round(t["entry_price"] * t["lots"] * t["lot_size"], 2),
             "Opened":   t["entry_time"],
         } for t in open_trades])
         st.dataframe(open_df, use_container_width=True, hide_index=True)
@@ -1494,7 +1493,7 @@ with tab_pt:
                 close_sel = st.selectbox("Select Trade", trade_labels)
                 close_tid = trade_ids[trade_labels.index(close_sel)]
             with cl2:
-                close_exit = st.number_input("Exit Premium â‚¹/unit", value=1.0,
+                close_exit = st.number_input("Exit Premium ₹/unit", value=1.0,
                                               min_value=0.05, step=0.5, format="%.2f")
             if st.form_submit_button("Close Trade", type="primary", use_container_width=True):
                 ok, msg = pt.close_trade(st.session_state, close_tid, float(close_exit))
@@ -1506,7 +1505,7 @@ with tab_pt:
     else:
         st.info("No open trades. Place a trade above.")
 
-    # â”€â”€ Closed Trades â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Closed Trades ─────────────────────────────────────────────────────────
     closed_trades = summary["closed_trades"]
     st.markdown("### Closed Trades ({})".format(len(closed_trades)))
 
@@ -1517,9 +1516,9 @@ with tab_pt:
             "Type":    t["type"],
             "Strike":  t["strike"],
             "Lots":    t["lots"],
-            "Entry â‚¹": t["entry_price"],
-            "Exit â‚¹":  t["exit_price"],
-            "P&L â‚¹":   t["pnl"],
+            "Entry ₹": t["entry_price"],
+            "Exit ₹":  t["exit_price"],
+            "P&L ₹":   t["pnl"],
             "Exited":  t["exit_time"],
         } for t in closed_trades])
 
@@ -1529,7 +1528,7 @@ with tab_pt:
             return "color: #888"
 
         st.dataframe(
-            closed_df.style.map(_pnl_color, subset=["P&L â‚¹"]),
+            closed_df.style.map(_pnl_color, subset=["P&L ₹"]),
             use_container_width=True, hide_index=True
         )
 
@@ -1544,14 +1543,14 @@ with tab_pt:
     else:
         st.info("No closed trades yet.")
 
-    # â”€â”€ Reset â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Reset ─────────────────────────────────────────────────────────────────
     st.divider()
     st.markdown("### Reset Portfolio")
     if "pt_confirm_reset" not in st.session_state:
         st.session_state.pt_confirm_reset = False
 
     if not st.session_state.pt_confirm_reset:
-        if st.button("Reset Portfolio to â‚¹1,00,000", type="secondary"):
+        if st.button("Reset Portfolio to ₹1,00,000", type="secondary"):
             st.session_state.pt_confirm_reset = True
             st.rerun()
     else:
@@ -1560,7 +1559,7 @@ with tab_pt:
         if yes_col.button("Yes, Reset Everything", type="primary"):
             pt.reset_portfolio(st.session_state)
             st.session_state.pt_confirm_reset = False
-            st.success("Portfolio reset to â‚¹1,00,000!")
+            st.success("Portfolio reset to ₹1,00,000!")
             st.rerun()
         if no_col.button("Cancel"):
             st.session_state.pt_confirm_reset = False
@@ -1568,12 +1567,12 @@ with tab_pt:
 
 
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# TAB 4 â€” CHAT
+# TAB 4 — CHAT
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_chat:
     st.markdown("## Chat with the Data")
     st.markdown(
-        "Discuss the trade before you place it â€” ask for a **Trade Decision** or run "
+        "Discuss the trade before you place it — ask for a **Trade Decision** or run "
         "the **Scalping Checklist**, then drill into any detail."
     )
 
@@ -1585,12 +1584,12 @@ with tab_chat:
     if _api_key_present:
         st.success("Claude AI (claude-haiku-4-5-20251001) enabled")
     else:
-        st.info("Keyword mode active â€” add `anthropic_api_key` to Streamlit secrets for AI answers")
+        st.info("Keyword mode active — add `anthropic_api_key` to Streamlit secrets for AI answers")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
-    # â”€â”€ Timeframe selector â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Timeframe selector ────────────────────────────────────────────────────
     st.markdown("#### Select Timeframe")
     tf_options = {
         "5-min":  "5-min Scalp",
@@ -1620,7 +1619,7 @@ with tab_chat:
     }
     st.caption("â± " + tf_info[selected_tf])
 
-    # â”€â”€ Primary action buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Primary action buttons ────────────────────────────────────────────────
     st.markdown("#### Start here:")
     pa1, pa2 = st.columns(2)
     if pa1.button(
@@ -1652,7 +1651,7 @@ with tab_chat:
 
     st.divider()
 
-    # â”€â”€ Chat history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -1694,7 +1693,7 @@ with tab_chat:
         st.rerun()
 
 
-# â”€â”€ Auto Refresh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Auto Refresh ──────────────────────────────────────────────────────────────
 if auto_refresh:
     time.sleep(refresh_interval)
     st.cache_data.clear()
