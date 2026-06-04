@@ -23,7 +23,7 @@ APP_VERSION = "v2.3"
 
 st.set_page_config(
     page_title="NSE Options Intelligence {}".format(APP_VERSION),
-    page_icon="ðŸ“ˆ",
+    page_icon="ðŸ"ˆ",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -96,7 +96,7 @@ if test_mode:
         raw = fetch_option_chain(symbol, is_index)
     if "error" in raw:
         st.error("NSE connection FAILED: " + raw["error"])
-        st.info("Try during market hours (9:15 AM “ 3:30 PM IST) on Indian internet.")
+        st.info("Try during market hours (9:15 AM " 3:30 PM IST) on Indian internet.")
     elif not raw:
         st.error("NSE returned empty response.")
     else:
@@ -332,9 +332,9 @@ with tab_live:
     oi_diff_v  = sig.get("oi_difference", 0)
     itm_r      = sig.get("itm_ratio", 0)
     oi1.metric("Call Sum (ATM±1)", "{:+.1f}K".format(call_sum_v),
-               delta="CE writing â†‘" if call_sum_v > 0 else "CE covering â†“")
+               delta="CE writing â†'" if call_sum_v > 0 else "CE covering â†"")
     oi2.metric("Put Sum (ATM±1)", "{:+.1f}K".format(put_sum_v),
-               delta="PE writing â†‘" if put_sum_v > 0 else "PE covering â†“")
+               delta="PE writing â†'" if put_sum_v > 0 else "PE covering â†"")
     oi3.metric("OI Difference", "{:+.1f}K".format(oi_diff_v),
                delta="Bearish" if oi_diff_v > 0 else "Bullish")
     oi4.metric("ITM Ratio", "{:.2f}x".format(itm_r),
@@ -377,12 +377,12 @@ with tab_live:
         st.markdown("#### Analysis Breakdown")
         for r in sig["reasons"]:
             rl   = r.lower()
-            if any(w in rl for w in [“bullish”,”support”,”upward”,”pe writing”,”put sum”,”itm ratio”,”covering”]):
-                st.markdown('<span style=”color:#26a69a”>▲</span> ' + r, unsafe_allow_html=True)
-            elif any(w in rl for w in [“bearish”,”resistance”,”downward”,”ce writing”,”call sum”]):
-                st.markdown('<span style=”color:#ef5350”>▼</span> ' + r, unsafe_allow_html=True)
+            if any(w in rl for w in ["bullish","support","upward","pe writing","put sum","itm ratio","covering"]):
+                st.markdown('<span style="color:#26a69a">▲</span> ' + r, unsafe_allow_html=True)
+            elif any(w in rl for w in ["bearish","resistance","downward","ce writing","call sum"]):
+                st.markdown('<span style="color:#ef5350">▼</span> ' + r, unsafe_allow_html=True)
             else:
-                st.markdown('<span style=”color:#FF9800”>◆</span> ' + r, unsafe_allow_html=True)
+                st.markdown('<span style="color:#FF9800">◆</span> ' + r, unsafe_allow_html=True)
         st.markdown("---")
         st.markdown("#### Key Levels")
         st.dataframe(pd.DataFrame({
@@ -778,7 +778,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         f2.add_trace(go.Bar(x=df["strike"], y=df["pe_chg_oi"]/1000, name="PE Build",
                             marker_color="#26a69a", opacity=0.4))
         # Net flow line (the KEY signal: positive = bullish PE building)
-        f2.add_trace(go.Scatter(x=df["strike"], y=net_oi_flow, name="Net OI Flow (PEâˆ’CE)",
+        f2.add_trace(go.Scatter(x=df["strike"], y=net_oi_flow, name="Net OI Flow (PEâˆ'CE)",
                                 mode="lines+markers",
                                 line=dict(color="#FFD700", width=2.5),
                                 marker=dict(color=flow_colors, size=8)))
@@ -795,7 +795,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         # Net OI flow summary
         net_total = net_oi_flow.sum()
         flow_bias = "[BULL] PE writing dominates (Bullish)" if net_total > 0 else "[BEAR] CE writing dominates (Bearish)"
-        st.caption("Net OI Flow: {:+.1f}K â†’ {}".format(net_total, flow_bias))
+        st.caption("Net OI Flow: {:+.1f}K â†' {}".format(net_total, flow_bias))
 
     ic1, ic2 = st.columns(2)
     with ic1:
@@ -828,8 +828,8 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
             '<div style="font-size:16px;color:{};text-align:center;margin-top:8px;">{}</div>'
             '<hr style="border-color:#333;margin:15px 0;">'
             '<div style="font-size:13px;color:#aaa;">'
-            'PCR &lt;0.5=Bearish | 0.5“0.8=Neutral-Bearish<br>'
-            'PCR 0.8“1.2=Neutral | 1.2“1.5=Bullish | &gt;1.5=Extremely Bullish'
+            'PCR &lt;0.5=Bearish | 0.5"0.8=Neutral-Bearish<br>'
+            'PCR 0.8"1.2=Neutral | 1.2"1.5=Bullish | &gt;1.5=Extremely Bullish'
             '</div></div>'.format(pcr_col, pcr, pcr_col, interp),
             unsafe_allow_html=True
         )
@@ -846,7 +846,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
         st.markdown(
             '<div style="background:#3d0000;border:2px solid #ef5350;padding:12px;border-radius:10px;margin-bottom:10px;">'
             '<b style="color:#ef5350;">âš¡ EXPIRY DAY</b> — {:.1f} market hours left | '
-            'Switch to <b>ðŸ“… Expiry Signals</b> tab for scalp targets</div>'.format(h_left),
+            'Switch to <b>ðŸ"… Expiry Signals</b> tab for scalp targets</div>'.format(h_left),
             unsafe_allow_html=True
         )
     elif 0 < h_left <= 24:
@@ -856,7 +856,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
             st.markdown(
                 '<div style="background:#1a2a00;border:2px solid #8BC34A;padding:12px;border-radius:10px;margin-bottom:10px;">'
                 '<b style="color:#8BC34A;">â° Expiry Tomorrow</b> — Next expiry: <b>{}</b> | '
-                'Switch to <b>ðŸ“… Expiry Signals</b> for next-expiry analysis</div>'.format(
+                'Switch to <b>ðŸ"… Expiry Signals</b> for next-expiry analysis</div>'.format(
                     next_info.get("next_expiry", "")),
                 unsafe_allow_html=True
             )
@@ -956,7 +956,7 @@ If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
 # TAB 2 — MARKET SCANNER
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_scan:
-    st.markdown("## ðŸ” Market Scanner")
+    st.markdown("## ðŸ" Market Scanner")
     st.markdown(
         "Multi-instrument trending analysis using **Murphy's OI+Price 4-scenario**, "
         "**Natenberg IV Rank**, and **McMillan PCR** methodologies."
@@ -974,7 +974,7 @@ with tab_scan:
             "Falling price + Rising OI = Bearish (fresh shorts)"
         )
 
-    if st.button("ðŸ”„ Scan Now", type="primary", key="scan_btn"):
+    if st.button("ðŸ"„ Scan Now", type="primary", key="scan_btn"):
         with st.spinner("Scanning instrumentsâ€¦"):
             if scan_demo_mode or data_source != "Angel One (Live)":
                 scan_results = sc.scan_demo(include_stocks=scan_stocks)
@@ -1058,7 +1058,7 @@ with tab_scan:
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
         st.caption(
-            "ðŸ“– Sources: Murphy J.J. (1999) Technical Analysis of Financial Markets Â· "
+            "ðŸ"– Sources: Murphy J.J. (1999) Technical Analysis of Financial Markets Â· "
             "Natenberg S. (2015) Option Volatility & Pricing Â· McMillan L.G. (2012) Options as a Strategic Investment"
         )
 
@@ -1067,7 +1067,7 @@ with tab_scan:
 # TAB 3 — EXPIRY SIGNALS
 # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 with tab_exp:
-    st.markdown("## ðŸ“… Expiry Signals")
+    st.markdown("## ðŸ"… Expiry Signals")
 
     # Re-compute ATM IV for this tab
     atm_iv_exp = 0.0
@@ -1090,7 +1090,7 @@ with tab_exp:
             '<div style="background:#2d0000;border:2px solid #ef5350;padding:15px;border-radius:12px;">'
             '<h3 style="color:#ef5350;margin:0;">âš¡ EXPIRY DAY — {:.1f} market hours left</h3>'
             '<p style="color:#ccc;margin:5px 0 0 0;">Augen (2009): Max Pain magnet effect strongest in last 2 hours. '
-            'Gamma spikes near ATM — scalp targets 30“80 points on NIFTY.</p>'
+            'Gamma spikes near ATM — scalp targets 30"80 points on NIFTY.</p>'
             '</div>'.format(h_left_exp),
             unsafe_allow_html=True
         )
@@ -1106,7 +1106,7 @@ with tab_exp:
 
     with exp_col:
         st.markdown("### Expiry Scalp Signal (Augen Framework)")
-        st.caption("Volume + OI change + Max Pain — 30“50 point targets")
+        st.caption("Volume + OI change + Max Pain — 30"50 point targets")
 
         exp_sig = ea.expiry_scalp_signal(df, meta, sig, atm_iv=atm_iv_exp)
 
@@ -1145,14 +1145,14 @@ with tab_exp:
         sl_p = round(prem * (1 - exp_sig["sl_pct"]), 1)
         tg_p = round(prem * (1 + exp_sig["tgt_pct"]), 1)
         st.dataframe(pd.DataFrame({
-            "Parameter": ["ATM Premium (est.)", "Stop-Loss (âˆ’30%)", "Target (+50%)",
+            "Parameter": ["ATM Premium (est.)", "Stop-Loss (âˆ'30%)", "Target (+50%)",
                           "Points Target", "Lot Size", "Best Hold"],
             "Value":     ["₹{:.1f}".format(prem),
                           "₹{:.1f}".format(sl_p),
                           "₹{:.1f}".format(tg_p),
                           "±{} pts (NIFTY)".format(exp_sig["pts_target"]),
                           "{} units".format(exp_sig["lot_size"]),
-                          "30“60 min or 3:15 PM"]
+                          "30"60 min or 3:15 PM"]
         }), hide_index=True, use_container_width=True)
 
     with next_col:
@@ -1207,7 +1207,7 @@ with tab_exp:
 
     # ── Theory section ────────────────────────────────────────────────────────
     st.markdown("### Expiry Day Trading Methodology")
-    with st.expander("ðŸ“– Augen (2009) — Expiry Day Framework", expanded=False):
+    with st.expander("ðŸ"– Augen (2009) — Expiry Day Framework", expanded=False):
         st.markdown("""
 **From "Trading Options at Expiration" by Jeff Augen:**
 
@@ -1216,13 +1216,13 @@ with tab_exp:
    - Trade smaller size — premium moves are violent
 
 2. **Max Pain Magnet**: In last 2 hours, underlying gravitates toward Max Pain
-   - Below Max Pain â†’ call writers buy back â†’ price rises
-   - Above Max Pain â†’ put writers buy back â†’ price falls
+   - Below Max Pain â†' call writers buy back â†' price rises
+   - Above Max Pain â†' put writers buy back â†' price falls
 
 3. **Time-of-day patterns (NSE Expiry)**:
-   - 9:20“10:30 AM: Gap fills and initial direction established
-   - 12:00“1:30 PM: Lull — avoid trading, volume low
-   - 2:00“3:15 PM: Max Pain pull strongest — last hour most reliable
+   - 9:20"10:30 AM: Gap fills and initial direction established
+   - 12:00"1:30 PM: Lull — avoid trading, volume low
+   - 2:00"3:15 PM: Max Pain pull strongest — last hour most reliable
 
 4. **Target sizing for NIFTY**:
    - 5 min expiry scalp: ±15-25 pts
@@ -1235,20 +1235,20 @@ with tab_exp:
    - 1-OTM = cheaper but lower delta, harder to recover from wrong direction
         """)
 
-    with st.expander("ðŸ“– Murphy (1999) — OI Analysis on Expiry", expanded=False):
+    with st.expander("ðŸ"– Murphy (1999) — OI Analysis on Expiry", expanded=False):
         st.markdown("""
 **From "Technical Analysis of Financial Markets" (Chapter 7 — Volume and OI):**
 
 | OI Change | Price Change | Interpretation | Action |
 |-----------|-------------|----------------|--------|
-| Rising OI + Rising Price | â†’ | Fresh longs entering = **Strong Bullish** | BUY CALL |
-| Rising OI + Falling Price | â†’ | Fresh shorts entering = **Strong Bearish** | BUY PUT |
-| Falling OI + Rising Price | â†’ | Short covering (weak move) = **Rally may fade** | CAUTION |
-| Falling OI + Falling Price | â†’ | Long liquidation (selling easing) = **Recovery near** | WATCH |
+| Rising OI + Rising Price | â†' | Fresh longs entering = **Strong Bullish** | BUY CALL |
+| Rising OI + Falling Price | â†' | Fresh shorts entering = **Strong Bearish** | BUY PUT |
+| Falling OI + Rising Price | â†' | Short covering (weak move) = **Rally may fade** | CAUTION |
+| Falling OI + Falling Price | â†' | Long liquidation (selling easing) = **Recovery near** | WATCH |
 
 On expiry day, **net OI flow near ATM** (within ±2 strikes) is the key signal:
-- PE writers adding OI at support â†’ market expects to hold support â†’ BUY CALL
-- CE writers adding OI at resistance â†’ market expects to hold resistance â†’ BUY PUT
+- PE writers adding OI at support â†' market expects to hold support â†' BUY CALL
+- CE writers adding OI at resistance â†' market expects to hold resistance â†' BUY PUT
         """)
 
     st.caption("âš ï¸ Educational only — not financial advice. Options trading involves significant risk.")
@@ -1382,7 +1382,7 @@ with tab_bt:
         elif bt_mode.startswith("C"):
             st.markdown("### Forward Paper Signal Tracker")
             st.markdown(
-                "Save today's signal â†’ auto-checked against next trading day's close. "
+                "Save today's signal â†' auto-checked against next trading day's close. "
                 "Builds a real-time accuracy log over time."
             )
 
@@ -1721,7 +1721,7 @@ with tab_chat:
         st.session_state.chat_history.append({"role": "assistant", "content": a})
         st.rerun()
 
-    checklist_label = "ðŸ“‹ {} Checklist".format(tf_options[selected_tf])
+    checklist_label = "ðŸ"‹ {} Checklist".format(tf_options[selected_tf])
     if pa2.button(
         checklist_label,
         use_container_width=True,
