@@ -17,6 +17,7 @@ import model_train
 import scanner as sc
 import expiry_analysis as ea
 import smart_analysis as sa
+import oi_tracker as oit
 
 APP_VERSION = "v2.3"
 
@@ -291,6 +292,17 @@ max_pain   = sig["max_pain"]
 source_tag = meta.get("source", data_source)
 meta["symbol"] = symbol
 
+# ── Persist OI snapshot on every fetch (survives browser refresh) ─────────────
+try:
+    oit.record_snapshot(
+        df, underlying, pcr,
+        call_sum_atm=sig.get("call_sum", 0) * 1000,   # tracker stores raw units
+        put_sum_atm =sig.get("put_sum",  0) * 1000,
+        symbol=symbol,
+    )
+except Exception:
+    pass
+
 # â”€â”€ Tabs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 tab_live, tab_scan, tab_exp, tab_bt, tab_pt, tab_chat = st.tabs(
     ["ðŸ“Š Live Dashboard", "ðŸ” Market Scanner", "ðŸ“… Expiry Signals",
@@ -387,6 +399,115 @@ with tab_live:
                 unsafe_allow_html=True
             )
 
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # OI TREND HISTORY — CE/PE/Net Flow change over time windows
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.markdown("### 📉 OI Trend History — Change per Time Window")
+    st.caption(
+        "Tracks CE OI, PE OI, Net Flow and PCR every refresh and compares with "
+        "snapshots from 5 min · 15 min · 30 min · 1 hr · 2 hr · 3 hr · 4 hr · 5 hr ago. "
+        "Data persists across browser refreshes (saved to disk)."
+    )
+
+    # Legend / explanation box
+    with st.expander("📖 What do these columns mean? (click to read)", expanded=False):
+        st.markdown("""
+| Column | What it is | Bullish if… | Bearish if… |
+|--------|-----------|-------------|-------------|
+| **CE OI Chg** | Change in total Call Open Interest | Negative (calls being closed/covered) | Positive (new calls being written = resistance building) |
+| **PE OI Chg** | Change in total Put Open Interest | Positive (new puts being written = support building) | Negative (puts being closed = support weakening) |
+| **Net Flow** | PE OI Chg − CE OI Chg | Positive (more put writing than call writing) | Negative (more call writing) |
+| **PCR Chg** | Change in Put-Call Ratio | Rising (more puts vs calls) | Falling |
+| **Spot Chg** | Price change since that snapshot | Rising | Falling |
+| **Trend** | 5-factor consensus | BULLISH 🟢 | BEARISH 🔴 |
+
+**Simple rule**: If CE OI is going DOWN and PE OI is going UP → Smart money is BULLISH (defending puts, covering calls).
+If CE OI is going UP and PE OI is going DOWN → Smart money is BEARISH.
+""")
+
+    # Build current state dict for delta computation
+    _oi_current = {
+        "ce_oi_total":  float(df["ce_oi"].sum()),
+        "pe_oi_total":  float(df["pe_oi"].sum()),
+        "call_sum_atm": sig.get("call_sum", 0) * 1000,
+        "put_sum_atm":  sig.get("put_sum",  0) * 1000,
+        "pcr":          pcr,
+        "underlying":   underlying,
+    }
+
+    _trend_rows = oit.get_trend_table(symbol, _oi_current)
+    _first_snap = oit.first_snapshot_time(symbol)
+    if _first_snap:
+        from datetime import datetime as _dt
+        _since = _dt.fromisoformat(_first_snap).strftime("%H:%M")
+        st.caption("📌 Tracking since **{}** today. Snapshots auto-saved every refresh.".format(_since))
+    else:
+        st.info("⏳ First snapshot will be saved now. Refresh the page after 5 minutes to see changes.")
+
+    # Render table
+    _display_rows = []
+    for r in _trend_rows:
+        if not r["has_data"]:
+            _display_rows.append({
+                "Window":         r["window"],
+                "Snap @":         r.get("snap_time") or "—",
+                "CE OI Chg":      r["age_str"],
+                "PE OI Chg":      "—",
+                "Net Flow":       "—",
+                "PCR Chg":        "—",
+                "Spot Chg":       "—",
+                "Trend":          r["trend"],
+                "What it means":  r["interpretation"],
+            })
+        else:
+            def _fmt_oi(v):
+                if v is None: return "—"
+                sign = "+" if v >= 0 else ""
+                if abs(v) >= 100000:
+                    return "{}{:.1f}L".format(sign, v/100000)
+                elif abs(v) >= 1000:
+                    return "{}{:.1f}K".format(sign, v/1000)
+                return "{}{}".format(sign, int(v))
+
+            _display_rows.append({
+                "Window":        r["window"],
+                "Snap @":        r["snap_time"],
+                "CE OI Chg":     _fmt_oi(r["ce_chg"]),
+                "PE OI Chg":     _fmt_oi(r["pe_chg"]),
+                "Net Flow":      _fmt_oi(r["net_flow"]),
+                "PCR Chg":       "{:+.3f}".format(r["pcr_chg"]) if r["pcr_chg"] is not None else "—",
+                "Spot Chg":      "{:+.1f}".format(r["spot_chg"]) if r["spot_chg"] is not None else "—",
+                "Trend":         r["trend"],
+                "What it means": r["interpretation"],
+            })
+
+    if _display_rows:
+        _tdf = pd.DataFrame(_display_rows)
+
+        def _trend_col(v):
+            if "BULL" in str(v):  return "color:#26a69a;font-weight:bold"
+            if "BEAR" in str(v):  return "color:#ef5350;font-weight:bold"
+            return "color:#FF9800"
+
+        def _num_col(v):
+            v = str(v)
+            if v.startswith("+") and v != "+0" and v != "+0.0":
+                return "color:#26a69a"
+            if v.startswith("-"):
+                return "color:#ef5350"
+            return ""
+
+        st.dataframe(
+            _tdf.style
+                .map(_trend_col, subset=["Trend"])
+                .map(_num_col,   subset=["CE OI Chg", "PE OI Chg", "Net Flow",
+                                         "PCR Chg", "Spot Chg"]),
+            use_container_width=True,
+            hide_index=True,
+            height=340,
+        )
     st.divider()
 
     # ═══════════════════════════════════════════════════════════════════════════
