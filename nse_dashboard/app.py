@@ -1,6 +1,8 @@
 import os
+import json
 import math
 import time
+import threading
 import streamlit as st
 import plotly.graph_objects as go
 import pandas as pd
@@ -18,7 +20,74 @@ import scanner as sc
 import expiry_analysis as ea
 import smart_analysis as sa
 
-APP_VERSION = "v2.4"
+APP_VERSION = "v2.5"
+
+# ── OI Snapshot disk persistence & background collector ───────────────────────
+_SNAP_FILE = os.path.join(os.path.dirname(__file__), ".oi_snapshots_cache.json")
+_bg_lock   = threading.Lock()
+
+def _load_snaps_from_disk():
+    try:
+        if os.path.exists(_SNAP_FILE):
+            with open(_SNAP_FILE) as _f:
+                _data = json.load(_f)
+            _cutoff = datetime.now() - timedelta(hours=7)
+            return [
+                {**{k: v for k, v in _s.items() if k != "time"},
+                 "time": datetime.fromisoformat(_s["time"])}
+                for _s in _data
+                if datetime.fromisoformat(_s["time"]) >= _cutoff
+            ]
+    except Exception:
+        pass
+    return []
+
+def _save_snaps_to_disk(snaps):
+    try:
+        _data = [{**{k: v for k, v in _s.items() if k != "time"},
+                  "time": _s["time"].isoformat()} for _s in snaps]
+        with _bg_lock:
+            with open(_SNAP_FILE, "w") as _f:
+                json.dump(_data, _f)
+    except Exception:
+        pass
+
+_BG_STARTED = {}
+
+def _start_bg_collector():
+    if "ok" in _BG_STARTED:
+        return
+    _BG_STARTED["ok"] = True
+
+    def _worker():
+        while True:
+            try:
+                for _bg_sym in ["NIFTY", "BANKNIFTY"]:
+                    _bg_raw = fetch_option_chain(_bg_sym, True)
+                    _bg_df, _bg_meta = parse_option_chain(_bg_raw, 20)
+                    if not _bg_df.empty and "error" not in _bg_meta:
+                        _bg_ts = datetime.now()
+                        _bg_sn = {
+                            "time":        _bg_ts,
+                            "symbol":      _bg_sym,
+                            "total_ce_oi": float(_bg_df["ce_oi"].sum()),
+                            "total_pe_oi": float(_bg_df["pe_oi"].sum()),
+                            "pcr":         float(_bg_meta.get("pcr", 1.0)),
+                            "underlying":  float(_bg_meta.get("underlying", 0)),
+                        }
+                        _bg_existing = _load_snaps_from_disk()
+                        _bg_sym_snaps = [x for x in _bg_existing if x.get("symbol", "") == _bg_sym]
+                        if not _bg_sym_snaps or (_bg_ts - _bg_sym_snaps[-1]["time"]).total_seconds() >= 55:
+                            _bg_existing.append(_bg_sn)
+                            _bg_cutoff = _bg_ts - timedelta(hours=7)
+                            _save_snaps_to_disk([x for x in _bg_existing if x["time"] >= _bg_cutoff])
+            except Exception:
+                pass
+            time.sleep(60)
+
+    threading.Thread(target=_worker, daemon=True, name="oi_bg_collector").start()
+
+_start_bg_collector()  # start once per process; safe no-op on repeated imports
 
 # yfinance fallback symbols for intraday data
 INDEX_YF_SYMBOLS = {
@@ -62,8 +131,8 @@ with st.sidebar:
             symbol = search_query
         is_index = False
 
-    num_strikes  = st.slider("Strikes around ATM", 10, 40, 20, step=2)
-    auto_refresh = st.checkbox("Auto Refresh", value=False)
+    num_strikes  = st.slider("Strikes around ATM", 10, 40, 10, step=2)
+    auto_refresh = st.checkbox("Auto Refresh", value=True)
     refresh_interval = st.selectbox(
         "Refresh every (sec)", [1, 5, 10, 30, 60, 120], index=3
     )
@@ -126,6 +195,24 @@ def _get_nse_data(sym, idx, strikes):
 def _get_angelone_data(sym, idx, strikes):
     from angelone_data import fetch_option_chain_angelone
     return fetch_option_chain_angelone(sym, idx, strikes)
+
+@st.cache_data(ttl=60)
+def _get_sensex_data(src, n):
+    if src == "Angel One (Live)":
+        try:
+            from angelone_data import fetch_option_chain_angelone
+            _d, _m = fetch_option_chain_angelone("SENSEX", True, n)
+            if not _d.empty and "error" not in _m:
+                return _d, _m
+        except Exception:
+            pass
+    elif src == "NSE Direct":
+        _r = fetch_option_chain("SENSEX", True)
+        if "error" not in _r:
+            _d, _m = parse_option_chain(_r, n)
+            if not _d.empty:
+                return _d, _m
+    return generate_demo_option_chain("SENSEX")
 
 @st.cache_data(ttl=300)
 def _get_candles(sym, idx, days, src):
@@ -285,22 +372,24 @@ if atm_iv == 0:
 _now_ts = datetime.now()
 _snap = {
     "time":        _now_ts,
+    "symbol":      symbol,
     "total_ce_oi": float(df["ce_oi"].sum()) if not df.empty else 0.0,
     "total_pe_oi": float(df["pe_oi"].sum()) if not df.empty else 0.0,
     "pcr":         float(pcr),
     "underlying":  float(underlying),
 }
 if "oi_snapshots" not in st.session_state:
-    st.session_state["oi_snapshots"] = []
+    st.session_state["oi_snapshots"] = _load_snaps_from_disk()
 _snaps = st.session_state["oi_snapshots"]
 if not _snaps or (_now_ts - _snaps[-1]["time"]).total_seconds() >= 60:
     _snaps.append(_snap)
-    cutoff = _now_ts - timedelta(hours=6)
+    cutoff = _now_ts - timedelta(hours=7)
     st.session_state["oi_snapshots"] = [s for s in _snaps if s["time"] >= cutoff]
+    _save_snaps_to_disk(st.session_state["oi_snapshots"])
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_live, tab_scan, tab_exp, tab_bt, tab_pt, tab_chat = st.tabs(
-    ["[Live] Dashboard", "[Scan] Scanner", "[Exp] Expiry Signals",
+tab_live, tab_sensex, tab_scan, tab_exp, tab_bt, tab_pt, tab_chat = st.tabs(
+    ["[Live] Dashboard", "[SENSEX] Live", "[Scan] Scanner", "[Exp] Expiry Signals",
      "[BT] Backtest", "[PT] Paper Trade", "[AI] Chat"]
 )
 
@@ -359,7 +448,29 @@ with tab_live:
     else:
         _chk_list.append(("ATM IV {:.1f}%".format(atm_iv), "MODERATE IV - fair entry", "#FF9800"))
 
-    # Check 5: Overall signal (from generate_signal)
+    # Check 5: 15-min OI flow direction from snapshots
+    _sym_snaps15 = [s for s in st.session_state.get("oi_snapshots", [])
+                    if s.get("symbol", symbol) == symbol]
+    _tgt_15m = _now_ts - timedelta(minutes=15)
+    _past_15m = [s for s in _sym_snaps15 if s["time"] <= _tgt_15m]
+    if _past_15m:
+        _old15 = _past_15m[-1]
+        _ce_15 = _snap["total_ce_oi"] - _old15["total_ce_oi"]
+        _pe_15 = _snap["total_pe_oi"] - _old15["total_pe_oi"]
+        _net15 = _pe_15 - _ce_15
+        if _net15 > 10000:
+            _chk_list.append(("OI 15-min Flow",
+                "PE {:+,.0f} / CE {:+,.0f} - PE writing pushing UP".format(int(_pe_15), int(_ce_15)), "#4CAF50"))
+        elif _net15 < -10000:
+            _chk_list.append(("OI 15-min Flow",
+                "CE {:+,.0f} / PE {:+,.0f} - CE writing pushing DOWN".format(int(_ce_15), int(_pe_15)), "#ef5350"))
+        else:
+            _chk_list.append(("OI 15-min Flow",
+                "Balanced CE {:+,.0f} / PE {:+,.0f}".format(int(_ce_15), int(_pe_15)), "#FF9800"))
+    else:
+        _chk_list.append(("OI 15-min Flow", "Collecting data - need 15 min of auto-refresh history", "#888888"))
+
+    # Check 6: Overall signal (from generate_signal)
     _sig_c = "#4CAF50" if sig["signal"] == "BUY CALL" else "#ef5350" if sig["signal"] == "BUY PUT" else "#FF9800"
     _chk_list.append(("Signal", "{} ({}% confidence, score: {})".format(
         sig["signal"], sig["confidence"], sig.get("score", 0)), _sig_c))
@@ -699,14 +810,14 @@ with tab_live:
     _curr_ce_h = float(df["ce_oi"].sum()) if not df.empty else 0.0
     _curr_pe_h = float(df["pe_oi"].sum()) if not df.empty else 0.0
     _time_windows = [
-        (5,   "5 min"),  (10, "10 min"), (15, "15 min"),
-        (60,  "1 hr"),   (120, "2 hr"),  (180, "3 hr"),
-        (240, "4 hr"),   (300, "5 hr"),
+        (1,   "1 min"),  (5,  "5 min"),  (10, "10 min"), (15, "15 min"), (30, "30 min"),
+        (60,  "1 hr"),   (120, "2 hr"),  (180, "3 hr"),  (240, "4 hr"),  (300, "5 hr"), (360, "6 hr"),
     ]
     _hist_rows = []
     for _mins, _label in _time_windows:
         _target_t = _now_ts - timedelta(minutes=_mins)
         _past = [s for s in st.session_state.get("oi_snapshots", [])
+                 if s.get("symbol", symbol) == symbol
                  if s["time"] <= _target_t]
         if _past:
             _old = _past[-1]
@@ -945,7 +1056,241 @@ with tab_live:
 
 
 # =============================================================================
-# TAB 2 - MARKET SCANNER
+# TAB 2 - SENSEX LIVE DASHBOARD
+# =============================================================================
+with tab_sensex:
+    st.markdown("## SENSEX Option Chain - Live")
+
+    with st.spinner("Fetching SENSEX data..."):
+        _sx_df, _sx_meta = _get_sensex_data(data_source, num_strikes)
+
+    _sx_underlying = float(_sx_meta.get("underlying", 80000))
+    _sx_expiry     = _sx_meta.get("expiry", "N/A")
+    _sx_src        = _sx_meta.get("source", data_source)
+
+    # Save SENSEX snapshot for OI history
+    if not _sx_df.empty:
+        _sx_sn = {
+            "time":        _now_ts,
+            "symbol":      "SENSEX",
+            "total_ce_oi": float(_sx_df["ce_oi"].sum()),
+            "total_pe_oi": float(_sx_df["pe_oi"].sum()),
+            "pcr":         float(_sx_meta.get("pcr", 1.0)),
+            "underlying":  _sx_underlying,
+        }
+        _all_snaps = st.session_state.get("oi_snapshots", [])
+        _sx_prev   = [s for s in _all_snaps if s.get("symbol") == "SENSEX"]
+        if not _sx_prev or (_now_ts - _sx_prev[-1]["time"]).total_seconds() >= 60:
+            _all_snaps.append(_sx_sn)
+            st.session_state["oi_snapshots"] = [
+                s for s in _all_snaps if s["time"] >= _now_ts - timedelta(hours=7)
+            ]
+            _save_snaps_to_disk(st.session_state["oi_snapshots"])
+
+    st.markdown("**Spot: Rs.{:,.2f}**  |  Expiry: **{}**  |  Source: `{}`".format(
+        _sx_underlying, _sx_expiry, _sx_src))
+
+    if _sx_df.empty:
+        st.warning("SENSEX option chain not available via NSE (it trades on BSE). Showing demo data.")
+
+    if not _sx_df.empty:
+        _sx_sig = generate_signal(_sx_df, _sx_meta)
+    else:
+        _sx_demo_df, _sx_demo_meta = generate_demo_option_chain("SENSEX")
+        _sx_sig = generate_signal(_sx_demo_df, _sx_demo_meta)
+
+    _sx_pcr      = float(_sx_sig.get("pcr", 1.0))
+    _sx_maxpain  = float(_sx_sig.get("max_pain", _sx_underlying))
+    _sx_atm_idx  = int((_sx_df["strike"] - _sx_underlying).abs().idxmin()) if not _sx_df.empty else 0
+    _sx_atm_iv   = float(_sx_df.iloc[_sx_atm_idx]["ce_iv"]) if not _sx_df.empty else 0.0
+    if _sx_atm_iv == 0 and not _sx_df.empty:
+        _sx_atm_iv = float(_sx_df["ce_iv"][_sx_df["ce_iv"] > 0].mean()) if (_sx_df["ce_iv"] > 0).any() else 15.0
+
+    # Signal card
+    sx1, sx2, sx3, sx4, sx5 = st.columns(5)
+    sx1.metric("SENSEX Spot",   "Rs.{:,.0f}".format(_sx_underlying))
+    sx2.metric("PCR",           str(_sx_pcr), delta="Bullish" if _sx_pcr > 1.0 else "Bearish")
+    sx3.metric("Max Pain",      "Rs.{:,.0f}".format(_sx_maxpain))
+    sx4.metric("CE Resistance", "Rs.{:,.0f}".format(_sx_sig.get("max_ce_resistance", _sx_underlying)))
+    sx5.metric("PE Support",    "Rs.{:,.0f}".format(_sx_sig.get("max_pe_support", _sx_underlying)))
+
+    st.divider()
+
+    # Build checkpoints (same logic as NIFTY tab)
+    _sx_chk = []
+    if _sx_pcr > 1.3:
+        _sx_chk.append(("PCR {:.2f}".format(_sx_pcr), "BULLISH - PE writing dominant", "#4CAF50"))
+    elif _sx_pcr < 0.7:
+        _sx_chk.append(("PCR {:.2f}".format(_sx_pcr), "BEARISH - CE writing dominant", "#ef5350"))
+    else:
+        _sx_chk.append(("PCR {:.2f}".format(_sx_pcr), "NEUTRAL (0.7-1.3 range)", "#FF9800"))
+
+    _sx_pain_diff = _sx_maxpain - _sx_underlying
+    if _sx_pain_diff > _sx_underlying * 0.001:
+        _sx_chk.append(("Max Pain Rs.{:,.0f}".format(_sx_maxpain),
+            "UPWARD PULL Rs.{:,.0f} above spot".format(abs(_sx_pain_diff)), "#4CAF50"))
+    elif _sx_pain_diff < -_sx_underlying * 0.001:
+        _sx_chk.append(("Max Pain Rs.{:,.0f}".format(_sx_maxpain),
+            "DOWNWARD PULL Rs.{:,.0f} below spot".format(abs(_sx_pain_diff)), "#ef5350"))
+    else:
+        _sx_chk.append(("Max Pain Rs.{:,.0f}".format(_sx_maxpain), "AT SPOT - no directional pull", "#FF9800"))
+
+    if not _sx_df.empty:
+        _sx_near = _sx_df.iloc[max(0, _sx_atm_idx-2):min(len(_sx_df), _sx_atm_idx+3)]
+        _sx_nce  = _sx_near["ce_chg_oi"].sum()
+        _sx_npe  = _sx_near["pe_chg_oi"].sum()
+        if _sx_npe > _sx_nce * 1.2:
+            _sx_chk.append(("ATM OI Build",
+                "BULLISH - PE {:+,.0f} > CE {:+,.0f} near ATM".format(_sx_npe, _sx_nce), "#4CAF50"))
+        elif _sx_nce > _sx_npe * 1.2:
+            _sx_chk.append(("ATM OI Build",
+                "BEARISH - CE {:+,.0f} > PE {:+,.0f} near ATM".format(_sx_nce, _sx_npe), "#ef5350"))
+        else:
+            _sx_chk.append(("ATM OI Build", "NEUTRAL - CE/PE OI balanced near ATM", "#FF9800"))
+
+    if _sx_atm_iv < 15:
+        _sx_chk.append(("ATM IV {:.1f}%".format(_sx_atm_iv), "LOW IV - cheap to buy", "#4CAF50"))
+    elif _sx_atm_iv > 25:
+        _sx_chk.append(("ATM IV {:.1f}%".format(_sx_atm_iv), "HIGH IV - expensive premiums", "#ef5350"))
+    else:
+        _sx_chk.append(("ATM IV {:.1f}%".format(_sx_atm_iv), "MODERATE IV - fair entry", "#FF9800"))
+
+    # 15-min OI flow for SENSEX
+    _sx_snaps15 = [s for s in st.session_state.get("oi_snapshots", []) if s.get("symbol") == "SENSEX"]
+    _sx_snap_curr_ce = float(_sx_df["ce_oi"].sum()) if not _sx_df.empty else 0.0
+    _sx_snap_curr_pe = float(_sx_df["pe_oi"].sum()) if not _sx_df.empty else 0.0
+    _sx_past15 = [s for s in _sx_snaps15 if s["time"] <= _now_ts - timedelta(minutes=15)]
+    if _sx_past15:
+        _sx_old15 = _sx_past15[-1]
+        _sx_ce15  = _sx_snap_curr_ce - _sx_old15["total_ce_oi"]
+        _sx_pe15  = _sx_snap_curr_pe - _sx_old15["total_pe_oi"]
+        _sx_net15 = _sx_pe15 - _sx_ce15
+        if _sx_net15 > 10000:
+            _sx_chk.append(("OI 15-min Flow", "PE {:+,.0f} / CE {:+,.0f} - Bullish push".format(int(_sx_pe15), int(_sx_ce15)), "#4CAF50"))
+        elif _sx_net15 < -10000:
+            _sx_chk.append(("OI 15-min Flow", "CE {:+,.0f} / PE {:+,.0f} - Bearish push".format(int(_sx_ce15), int(_sx_pe15)), "#ef5350"))
+        else:
+            _sx_chk.append(("OI 15-min Flow", "Balanced CE {:+,.0f} / PE {:+,.0f}".format(int(_sx_ce15), int(_sx_pe15)), "#FF9800"))
+    else:
+        _sx_chk.append(("OI 15-min Flow", "Collecting (need 15 min of auto-refresh)", "#888888"))
+
+    _sx_sig_c = "#4CAF50" if _sx_sig["signal"] == "BUY CALL" else "#ef5350" if _sx_sig["signal"] == "BUY PUT" else "#FF9800"
+    _sx_chk.append(("Signal", "{} ({}% conf)".format(_sx_sig["signal"], _sx_sig["confidence"]), _sx_sig_c))
+
+    _sx_bull = sum(1 for _, _, c in _sx_chk if c == "#4CAF50")
+    _sx_bear = sum(1 for _, _, c in _sx_chk if c == "#ef5350")
+    _sx_neut = sum(1 for _, _, c in _sx_chk if c == "#FF9800")
+    if _sx_bull >= 3 and _sx_bull > _sx_bear:
+        _sx_v, _sx_vc = "BUY CALL", "#4CAF50"
+    elif _sx_bear >= 3 and _sx_bear > _sx_bull:
+        _sx_v, _sx_vc = "BUY PUT", "#ef5350"
+    elif _sx_bull == 2 and _sx_bull > _sx_bear:
+        _sx_v, _sx_vc = "LEAN BULLISH", "#8BC34A"
+    elif _sx_bear == 2 and _sx_bear > _sx_bull:
+        _sx_v, _sx_vc = "LEAN BEARISH", "#FF7043"
+    else:
+        _sx_v, _sx_vc = "WAIT / NEUTRAL", "#FF9800"
+
+    _sx_rows_html = ""
+    for _sl, _sd, _sc in _sx_chk:
+        _si = "BULL" if _sc == "#4CAF50" else "BEAR" if _sc == "#ef5350" else "NEUT"
+        _sx_rows_html += (
+            '<div style="display:flex;gap:10px;padding:4px 0;border-bottom:1px solid #2a2a3e;">'
+            '<span style="color:{c};font-weight:bold;font-size:11px;min-width:44px;flex-shrink:0;">[{i}]</span>'
+            '<span style="color:#bbb;font-size:12px;min-width:150px;flex-shrink:0;">{l}</span>'
+            '<span style="color:{c};font-size:12px;">{d}</span>'
+            '</div>'
+        ).format(c=_sc, i=_si, l=_sl, d=_sd)
+
+    st.markdown(
+        '<div style="background:#12122a;border:2px solid {vc};border-radius:12px;padding:14px;margin-bottom:14px;">'
+        '<div style="font-size:11px;color:#888;letter-spacing:1px;margin-bottom:8px;">'
+        'SENSEX LIVE SIGNAL SUMMARY - Book Checkpoints</div>'
+        '{rows}'
+        '<div style="margin-top:10px;text-align:center;padding:8px;background:#0d0d1e;border-radius:8px;">'
+        '<span style="font-size:20px;font-weight:bold;color:{vc};">OVERALL: {v}</span>'
+        '&nbsp;&nbsp;<span style="color:#888;font-size:12px;">{b} bullish / {br} bearish / {n} neutral</span>'
+        '</div></div>'.format(
+            vc=_sx_vc, rows=_sx_rows_html, v=_sx_v,
+            b=_sx_bull, br=_sx_bear, n=_sx_neut
+        ),
+        unsafe_allow_html=True
+    )
+
+    st.divider()
+
+    # SENSEX Option chain table
+    if not _sx_df.empty:
+        sxc1, sxc2 = st.columns(2)
+        with sxc1:
+            st.markdown("#### Signal Gauge")
+            _sx_bg  = {"green": "#1a7a1a", "red": "#8b1a1a", "orange": "#7a5c00"}.get(_sx_sig.get("color",""), "#333")
+            _sx_bc  = {"green": "#4CAF50", "red": "#f44336", "orange": "#FF9800"}.get(_sx_sig.get("color",""), "#888")
+            st.markdown(
+                '<div style="background:{bg};border:3px solid {bc};padding:20px;border-radius:14px;text-align:center;">'
+                '<div style="font-size:28px;font-weight:bold;color:{bc};">{sig}</div>'
+                '<div style="font-size:36px;font-weight:bold;color:white;">{conf}%</div>'
+                '</div>'.format(bg=_sx_bg, bc=_sx_bc, sig=_sx_sig["signal"], conf=_sx_sig["confidence"]),
+                unsafe_allow_html=True
+            )
+        with sxc2:
+            st.markdown("#### Key Levels")
+            st.dataframe(pd.DataFrame({
+                "Level": ["SENSEX Spot", "Max Pain", "CE Resistance", "PE Support"],
+                "Price": [_sx_underlying, _sx_maxpain,
+                          _sx_sig.get("max_ce_resistance", _sx_underlying),
+                          _sx_sig.get("max_pe_support", _sx_underlying)],
+            }), hide_index=True, use_container_width=True)
+
+        st.divider()
+        st.markdown("#### SENSEX OI Trend History")
+        _sx_tw = [
+            (1,"1 min"),(5,"5 min"),(10,"10 min"),(15,"15 min"),(30,"30 min"),
+            (60,"1 hr"),(120,"2 hr"),(180,"3 hr"),(240,"4 hr"),(300,"5 hr"),(360,"6 hr"),
+        ]
+        _sx_hist_rows = []
+        for _sm, _sl in _sx_tw:
+            _sx_tgt = _now_ts - timedelta(minutes=_sm)
+            _sx_past = [s for s in _sx_snaps15 if s["time"] <= _sx_tgt]
+            if _sx_past:
+                _sx_o = _sx_past[-1]
+                _sx_cchg = _sx_snap_curr_ce - _sx_o["total_ce_oi"]
+                _sx_pchg = _sx_snap_curr_pe - _sx_o["total_pe_oi"]
+                _sx_net  = _sx_pchg - _sx_cchg
+                _sx_pcr_c = _sx_pcr - _sx_o.get("pcr", _sx_pcr)
+                _sx_bias = "PE building - Bullish" if _sx_net > 10000 else \
+                           "CE building - Bearish" if _sx_net < -10000 else "Balanced"
+                _sx_hist_rows.append({
+                    "Period": _sl, "CE OI Chg": "{:+,.0f}".format(int(_sx_cchg)),
+                    "PE OI Chg": "{:+,.0f}".format(int(_sx_pchg)),
+                    "Net Flow": "{:+,.0f}".format(int(_sx_net)),
+                    "PCR Chg": "{:+.2f}".format(_sx_pcr_c), "Trend": _sx_bias,
+                })
+            else:
+                _sx_hist_rows.append({
+                    "Period": _sl, "CE OI Chg": "collecting...", "PE OI Chg": "collecting...",
+                    "Net Flow": "collecting...", "PCR Chg": "collecting...", "Trend": "Need data",
+                })
+        _sx_hdf = pd.DataFrame(_sx_hist_rows)
+        st.dataframe(
+            _sx_hdf.style.map(_color_hist_trend, subset=["Trend"]),
+            hide_index=True, use_container_width=True
+        )
+
+        st.divider()
+        st.markdown("#### SENSEX Option Chain (Near ATM)")
+        _sx_disp_cols = ["strike", "ce_oi", "ce_chg_oi", "ce_ltp", "ce_iv",
+                         "pe_iv", "pe_ltp", "pe_chg_oi", "pe_oi"]
+        _sx_disp_cols = [c for c in _sx_disp_cols if c in _sx_df.columns]
+        st.dataframe(_sx_df[_sx_disp_cols].reset_index(drop=True),
+                     hide_index=True, use_container_width=True, height=350)
+
+    st.caption("SENSEX options trade on BSE. Data may be demo/simulated when using NSE Direct source. "
+               "Use Angel One (Live) for real BSE SENSEX data.")
+
+
+# =============================================================================
+# TAB 3 - MARKET SCANNER
 # =============================================================================
 with tab_scan:
     st.markdown("## Market Scanner")
