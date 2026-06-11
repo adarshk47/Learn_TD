@@ -10,8 +10,8 @@ def generate_demo_option_chain(symbol="NIFTY"):
     random.seed(seed)
     np.random.seed(seed % (2**31))
 
-    base_prices = {"NIFTY": 24350, "BANKNIFTY": 52400, "FINNIFTY": 23800, "MIDCPNIFTY": 12200}
-    strike_gaps = {"NIFTY": 50,    "BANKNIFTY": 100,   "FINNIFTY": 50,    "MIDCPNIFTY": 25}
+    base_prices = {"NIFTY": 24350, "BANKNIFTY": 52400, "FINNIFTY": 23800, "MIDCPNIFTY": 12200, "SENSEX": 82000}
+    strike_gaps = {"NIFTY": 50,    "BANKNIFTY": 100,   "FINNIFTY": 50,    "MIDCPNIFTY": 25,   "SENSEX": 100}
 
     underlying = base_prices.get(symbol, 24350) + random.randint(-200, 200)
     gap        = strike_gaps.get(symbol, 50)
