@@ -96,11 +96,13 @@ def _nearest_expiry(expiries):
 def _get_option_tokens(instruments, symbol, expiry_str):
     """
     Return dict: strike -> {"CE": token, "PE": token, "lot_size": n}
-    Handles index (NFO exch, OPTIDX) and stock (NFO exch, OPTSTK) instruments.
+    Handles NSE indices/stocks (NFO) and BSE SENSEX (BFO).
     """
+    # SENSEX options trade on BSE F&O (BFO), all others on NSE F&O (NFO)
+    target_exch = "BFO" if symbol.upper() == "SENSEX" else "NFO"
     result = {}
     for inst in instruments:
-        if inst.get("exch_seg") != "NFO":
+        if inst.get("exch_seg") != target_exch:
             continue
         inst_type = inst.get("instrumenttype", "")
         if inst_type not in ("OPTIDX", "OPTSTK"):
@@ -108,16 +110,14 @@ def _get_option_tokens(instruments, symbol, expiry_str):
         name = inst.get("name", "").upper()
         if name != symbol.upper():
             continue
-        # expiry check — instrument expiry in DDMMMYYYY
         inst_exp = inst.get("expiry", "").upper()
-        # normalise both to YYYY-MM-DD for comparison
         inst_date = _parse_date(inst_exp)
         tgt_date  = _parse_date(expiry_str)
         if inst_date != tgt_date:
             continue
         try:
-            strike    = float(inst.get("strike", 0)) / 100  # Angel stores strike*100
-            opt_type  = inst.get("symbol", "")[-2:]         # last 2 chars: CE or PE
+            strike    = float(inst.get("strike", 0)) / 100
+            opt_type  = inst.get("symbol", "")[-2:]
             token     = inst.get("token", "")
             lot_size  = int(inst.get("lotsize", 1))
             if strike not in result:
@@ -128,9 +128,10 @@ def _get_option_tokens(instruments, symbol, expiry_str):
     return result
 
 def _get_all_expiries(instruments, symbol):
+    target_exch = "BFO" if symbol.upper() == "SENSEX" else "NFO"
     expiries = set()
     for inst in instruments:
-        if inst.get("exch_seg") != "NFO":
+        if inst.get("exch_seg") != target_exch:
             continue
         if inst.get("instrumenttype") not in ("OPTIDX", "OPTSTK"):
             continue
@@ -286,13 +287,14 @@ def fetch_option_chain_angelone(symbol, is_index=True, num_strikes=20, strike_ra
         return results
 
     # Collect all tokens to fetch
+    opt_exchange = "BFO" if symbol.upper() == "SENSEX" else "NFO"
     tokens_to_fetch = {}
     for strike in selected_strikes:
         info = token_map[strike]
         for opt_type in ("CE", "PE"):
             tok = info.get(opt_type)
             if tok:
-                tokens_to_fetch[str(tok)] = "NFO"
+                tokens_to_fetch[str(tok)] = opt_exchange
 
     market_data = _batched_market_data(tokens_to_fetch)
 

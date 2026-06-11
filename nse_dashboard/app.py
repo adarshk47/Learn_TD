@@ -203,6 +203,7 @@ def _get_sensex_data(src, n):
             from angelone_data import fetch_option_chain_angelone
             _d, _m = fetch_option_chain_angelone("SENSEX", True, n)
             if not _d.empty and "error" not in _m:
+                _m["source"] = "Angel One (Live) - BSE"
                 return _d, _m
         except Exception:
             pass
@@ -212,7 +213,9 @@ def _get_sensex_data(src, n):
             _d, _m = parse_option_chain(_r, n)
             if not _d.empty:
                 return _d, _m
-    return generate_demo_option_chain("SENSEX")
+    _d, _m = generate_demo_option_chain("SENSEX")
+    _m["source"] = "Demo (SENSEX options on BSE - not available via NSE)"
+    return _d, _m
 
 @st.cache_data(ttl=300)
 def _get_candles(sym, idx, days, src):
